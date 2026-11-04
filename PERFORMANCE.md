@@ -26,10 +26,10 @@ depends on that, it says so.
   usually blames (the per-step `bodies.sort` is 0.7%).
 - Solver is 29%, broadphase 9%, integration 2%, rendering ~2%.
 - A typed-array granular solver does the same for piles of small round things in
-  **~0.2 µs per moving grain**, and it is now a first-class toy: sand and water
-  pour from hoppers, bury crates, ride belts, and **sleep when they settle**, so
-  8,000 settled grains cost 0.17 ms - less than 8,000 moving ones cost per
-  frame of a 60 Hz budget by a factor of ten.
+  **~0.5 µs per moving grain**, and it is now a first-class toy: sand and water
+  pour from hoppers, bury crates, ride belts, and **go to sleep when they
+  settle**, so 8,000 settled grains cost 0.24 ms - a twentieth of what the same
+  8,000 cost while they are still moving.
 - The wall for grains is *packing density*, not body count: past ~60% of the
   box the contact graph is over-constrained, the pile never settles, and the
   step time goes up an order of magnitude. The wall for rigid bodies is matter's
@@ -191,23 +191,22 @@ Measured in the app (`?bench`, `box.grains(n)`), box 1416×606, `est-60hz`:
 
 | grains | radius | state | step ms | µs/grain |
 |---:|---:|---|---:|---:|
-| 2 000 | 3 | all falling | 0.43 | 0.22 |
-| 4 000 | 3 | all falling | 0.94 | 0.24 |
-| 8 000 | 3 | all falling | 1.70 | 0.21 |
-| 4 000 | 3 | settled | **0.17** | 0.04 |
-| 8 000 | 3 | settled | **0.17** | 0.02 |
+| 4 000 | 3 | all falling | 1.55 | 0.39 |
+| 8 000 | 3 | all falling | 4.86 | 0.61 |
+| 4 000 | 3 | settled | **0.07** | 0.02 |
+| 8 000 | 3 | settled | **0.24** | 0.03 |
 | 7 000 | 5 | 64% packed (a full box) | 4.2 | 0.6 |
 
 Three things fall out of that table:
 
-1. **Asleep grains are nearly free.** 8,000 settled grains cost the same as
-   4,000: the sleep window is the only work left, and it is a subtraction.
-2. **An awake grain is ~0.2 µs**, so 8,000 of them moving at once is 1.7 ms of a
-   16.7 ms budget. This is 6-8× cheaper per body than the 1.5 µs/body the first
-   prototype measured, because the contact loop no longer does velocity work it
-   cannot use.
+1. **Asleep grains are nearly free.** 8,000 settled grains cost 0.24 ms, because
+   after settling only ~80 of them are still moving: everything else is skipped,
+   and the only per-grain work left is the grid and the sleep window.
+2. **An awake grain is ~0.5 µs**, so 8,000 of them moving at once is 4.9 ms of a
+   16.7 ms budget. That is still 3-4× cheaper per body than matter's 9 µs, and
+   the awake count is what a scene should be judged on.
 3. **The ceiling is the box, not the solver.** Pack the same box to 64% and the
-   solver can no longer converge: the pile never comes to rest, so nothing
+   contact graph is over-constrained: the pile never comes to rest, so nothing
    sleeps, and step time goes up an order of magnitude. At 90% packing (16,000
    grains of r=3) it collapses to 136 ms/step. That is a box *full of sand*, and
    no amount of tuning fixes it - the contact graph is over-constrained.
@@ -219,6 +218,27 @@ definition, so the price of pouring is the stream: ~400 grains in flight is
 0.08 ms. What piles up goes to sleep behind it. The interesting measurement is
 therefore the one the toy actually produces - pour for a while and read
 `grains` against `grainsAwake` in `stats()`.
+
+### Making a pile actually stop
+
+Two things had to be true before sleep could be invisible rather than a glitch:
+
+- **A contact has to kill the velocity it is holding.** A supported grain picks
+  up one gravity step per frame and is pushed straight back out of the contact:
+  the position comes back, the velocity does not, so the heap churns at
+  ~0.3 px/step for ever. Each grain accumulates the contact normal it is being
+  pushed along, and that component of its velocity is removed at the end of the
+  step. Tangential motion is untouched, so a stream keeps falling while a pile
+  stops. Measured effect on a 240-grain heap: mean creep over 30 steps went from
+  **8.3 px to 0.01 px**.
+- **Perfect circles roll for ever.** Real sand is angular. A contacted grain
+  below 1.5 px/step keeps `rolling` (0.9 for sand, 0.995 for water) of its
+  speed per step. Measured effect on 8,000 grains settled in a wide box:
+  **3,122 awake became 81**.
+
+With both in place, waking a settled heap moves it by a mean of 1 px, and a grain
+arriving at 12 px/step makes a crater instead of an explosion - both pinned by
+tests in `grains.test.ts`.
 
 ### What it gives up, and why that is the right trade
 
@@ -406,8 +426,8 @@ The measured budget at 60 Hz is 16.7 ms:
 | workload | physics | draw (instanced) | total |
 |---|---:|---:|---:|
 | 1 000 matter balls | 4.1 ms | 0.3 ms | 4.4 ms |
-| 8 000 grains, all moving | 1.7 ms | 0.1 ms | 1.8 ms |
-| 8 000 grains, settled | 0.2 ms | 0.1 ms | 0.3 ms |
+| 8 000 grains, all moving | 4.9 ms | 0.2 ms | 5.1 ms |
+| 8 000 grains, settled | 0.24 ms | 0.2 ms | 0.44 ms |
 | 10 000 matter boxes | 13.8 ms | 0.4 ms | 14.2 ms |
 | 7 000 grains at 64% packing | 4.2 ms | 0.1 ms | 4.3 ms |
 | 16 000 grains at 90% packing | 136 ms | 0.3 ms | 136 ms |

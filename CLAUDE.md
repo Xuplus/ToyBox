@@ -69,11 +69,11 @@ bundle served by Caddy**, and the `/toybox` prefix is baked into the build via
   mean) and `color.ts` (shade/alpha). Pure, no DOM.
 - `src/physics/grains.ts` — the **granular layer**: sand and water. Circles in
   `Float32Array`s, counting-sort uniform grid, relaxation passes, no rotation, so
-  it is for piles rather than shapes. 5–12× cheaper per body than Matter, and a
-  settled pile sleeps, so it is also cheaper than that once it stops.
+  it is for piles rather than shapes. ~0.5 µs per *moving* grain against matter's
+  9, and a settled pile sleeps, so it is cheaper again once it stops.
   `MATERIALS` at the top of the file is the only description of what each
-  material is: colour, alpha, rim, friction, restitution, cohesion, sleep. Both
-  painters read it, so a new material is one entry.
+  material is: colour, alpha, rim, friction, restitution, cohesion, rolling
+  resistance, sleep. Both painters read it, so a new material is one entry.
 - `src/engine/sprites.ts` — pre-rendered ball sprites, **canvas 2D path only**.
   Drawing a ball from gradients costs ~4× a blit; at a thousand balls that is a
   third of the frame. The WebGL path shades circles in a fragment shader and
@@ -147,10 +147,21 @@ Always run `npm run typecheck` and `npm run test` after changes.
   (`resize()` keeps the grains). Grains never become Matter bodies and Matter
   bodies never become grains — they meet through `GrainCollider`, which
   `Matter.Body` satisfies structurally. The solver must not import Matter.
-- **A grain's velocity is not a measure of rest.** A packed heap churns at
-  ~2 px/step while going nowhere, so sleep is decided on how far a grain moved
-  over a window (see `SLEEP_WINDOW`/`SLEEP_DRIFT` in `grains.ts`). Do not
-  "simplify" that to a velocity threshold: the heap will never sleep.
+- **A grain's velocity is not a measure of rest.** A packed heap is never
+  perfectly still, so sleep is decided on how far a grain moved over a window
+  (see `SLEEP_WINDOW`/`SLEEP_DRIFT` in `grains.ts`). Do not "simplify" that to a
+  velocity threshold: the heap will never sleep.
+- **A contact must kill the velocity it is holding.** `step()` accumulates the
+  direction each grain was pushed (`supX`/`supY`) and removes that component of
+  its velocity at the end of the step. Without it a supported grain keeps the
+  gravity step it was given, and the heap creeps for ever — which is what makes
+  sleep freeze a pile in a shape it was still falling out of, and makes waking
+  one look like an explosion. Tangential motion must stay untouched, or sand
+  stops flowing and water stops levelling.
+- **Perfect circles roll for ever.** `rolling` in `MATERIALS` is the only reason
+  a flat layer of grains ever stops: 0.9 for sand, 0.995 for water. It applies
+  only to contacted grains slower than `ROLL_SPEED`, so a falling stream is
+  unaffected.
 - **Shared header UX.** Top bar in normal flow — home (`🏠`, `href="/"` → the
   `elnuevos.es` root) + `🧰` title on the left, controls and language on the
   right. Never absolutely positioned. Mirrors the sibling games.
@@ -183,8 +194,8 @@ Performance is measured, not estimated: `PERFORMANCE.md` has the curves and
 `npm run bench` reproduces them. The short version: **neither painter is the
 wall** — WebGL2 draws anything from 500 to 20,000 bodies in 0.06–0.5 ms — and
 the two ceilings are 9 µs per rigid body (matter, ~2,000 of them at 60 Hz) and
-packing density for grains (8,000 moving grains is 1.7 ms; a settled pile is
-free; a box packed past ~60% never settles at all).
+packing density for grains (8,000 moving grains is 4.9 ms; the same 8,000
+settled is 0.24 ms; a box packed past ~60% never settles at all).
 
 Ideas still open (see `PLAN.md §8`): saving a scene in `localStorage`, a
 "shake" button, funnels/dominoes as extra toy families, ropes and explosives on

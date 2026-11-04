@@ -47,8 +47,8 @@ physics is what costs. Drawing goes to the GPU as a handful of instanced draw
 calls (`src/engine/gl/`), so the painter takes 0.06–0.5 ms whatever is in the box
 — against 8.6–12.6 ms for the canvas 2D path at a few thousand bodies, which is
 kept as the fallback (`?render=2d`). The granular layer is cheaper still: 8,000
-grains all in motion is 1.7 ms of the frame, and the same 8,000 once they have
-settled is 0.2 ms.
+grains all in motion is 4.9 ms of the frame, and the same 8,000 once they have
+settled is 0.24 ms.
 
 The numbers, the method and the caveats (headless has no vsync; `draw-ms` under
 WebGL is CPU submission, not GPU work) are in

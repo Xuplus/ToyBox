@@ -47,6 +47,10 @@ export interface GrainMaterialSpec {
   restitution: number;
   /** px of pull across the contact gap per pass - surface tension */
   cohesion: number;
+  /** fraction of the speed a slow, contacted grain keeps per step. Perfect\r
+   *  circles roll for ever on a flat floor; real sand is angular and stops, and\r
+   *  this is the cheapest honest approximation of that. */
+  rolling: number;
   /** quiet windows before a grain is put to sleep. Water needs more, because
    *  a puddle that has not finished levelling still has somewhere to go. */
   sleepWindows: number;
@@ -62,6 +66,7 @@ export const MATERIALS: readonly GrainMaterialSpec[] = [
     friction: 0.22,
     restitution: 0.1,
     cohesion: 0,
+    rolling: 0.9,
     sleepWindows: 1,
   },
   {
@@ -73,6 +78,7 @@ export const MATERIALS: readonly GrainMaterialSpec[] = [
     friction: 0.03,
     restitution: 0.04,
     cohesion: 0.06,
+    rolling: 0.995,
     sleepWindows: 2,
   },
 ];
@@ -115,10 +121,13 @@ export interface GrainCollider {
  * grain in free fall (which covers hundreds of px in that time) never qualifies.
  */
 const SLEEP_WINDOW = 30;
-const SLEEP_DRIFT = 12;
+const SLEEP_DRIFT = 3;
 
 /** Impact speed (px/step) that counts as a real hit, for the bounce. */
 const BOUNCE_SPEED = 0.5;
+
+/** Below this speed a contacted grain is rolling, not falling, and is damped. */
+const ROLL_SPEED = 1.5;
 
 /** A packed heap churns at ~2 px/step without going anywhere, so waking a
  *  sleeping grain needs a real impact behind it, not solver noise. */
@@ -156,6 +165,10 @@ export class GrainWorld {
 
   /** 1 when a grain had a contact during the current step */
   private readonly touched: Uint8Array;
+  /** accumulated contact normal, weighted by how far it pushed this grain:
+   *  the direction a grain is being supported from */
+  private readonly supX: Float32Array;
+  private readonly supY: Float32Array;
   /** position at the start of the current sleep window */
   private readonly anchorX: Float32Array;
   private readonly anchorY: Float32Array;
@@ -224,6 +237,8 @@ export class GrainWorld {
     this.kind = new Uint8Array(capacity);
     this.asleep = new Uint8Array(capacity);
     this.touched = new Uint8Array(capacity);
+    this.supX = new Float32Array(capacity);
+    this.supY = new Float32Array(capacity);
     this.anchorX = new Float32Array(capacity);
     this.anchorY = new Float32Array(capacity);
     this.anchorTick = new Uint8Array(capacity);
@@ -431,7 +446,11 @@ export class GrainWorld {
     const lastCol = cols - 1;
     const lastRow = rows - 1;
     const touched = this.touched;
+    const supX = this.supX;
+    const supY = this.supY;
     touched.fill(0, 0, n);
+    supX.fill(0, 0, n);
+    supY.fill(0, 0, n);
 
     for (let pass = 0; pass < iterations; pass++) {
       for (let i = 0; i < n; i++) {
@@ -503,22 +522,30 @@ export class GrainWorld {
               // A sleeping grain only wakes for a real impact. Waking it for
               // every touch would cascade through a settled heap - each grain
               // would wake its neighbour in turn and nothing would ever sleep.
-              if (asleep[j] === 1) {
-                if (-normalSpeed <= WAKE_SPEED) continue;
-                this.wake(j);
-              }
+              if (asleep[j] === 1 && -normalSpeed > WAKE_SPEED) this.wake(j);
+              // Until it wakes, it is a wall: the awake grain takes the whole
+              // correction, and nothing is pushed into the sleeping one. That
+              // matters - letting awake grains sink into a sleeping patch
+              // leaves a pile full of overlaps that all resolve at once the
+              // moment something wakes it, which looks like a small explosion.
+              const fixed = asleep[j] === 1;
 
-              // Position: half the overlap each. The correction is capped:
-              // resolving a deep overlap in one step is a large displacement,
-              // and a grain that lands hard should sink in and surface over the
-              // next few steps instead of being fired back out.
-              const push = Math.min(minDist - d, r * 1.2) * 0.5;
+              const push = Math.min(minDist - d, r * 1.2) * (fixed ? 1 : 0.5);
               x[i] = xi - nx * push;
               y[i] = yi - ny * push;
-              x[j] += nx * push;
-              y[j] += ny * push;
+              if (!fixed) {
+                x[j] += nx * push;
+                y[j] += ny * push;
+              }
               touched[i] = 1;
+              // Remember which way this grain was pushed: that is the direction
+              // it is supported from, and the one its velocity has to lose.
+              supX[i] -= nx * push;
+              supY[i] -= ny * push;
+              if (fixed) continue;
               touched[j] = 1;
+              supX[j] += nx * push;
+              supY[j] += ny * push;
 
               if (normalSpeed >= 0) continue; // already separating
 
@@ -550,6 +577,30 @@ export class GrainWorld {
     // --- rigid bodies ------------------------------------------------------
     this.collideBodies();
 
+    // --- kill the velocity that contacts are holding ------------------------
+    // A grain resting on a pile picks up one gravity step per frame and is
+    // pushed straight back out of the contact; the position comes back but the
+    // velocity never does, so the heap churns for ever without going anywhere.
+    // The support direction says which part of that velocity is being held, so
+    // remove exactly that. Tangential motion (sliding, flowing) is untouched,
+    // which is why a stream keeps falling while a pile stops.
+    for (let i = 0; i < n; i++) {
+      if (asleep[i] === 1) continue;
+      const sx = supX[i];
+      const sy = supY[i];
+      const len2 = sx * sx + sy * sy;
+      if (len2 === 0) continue;
+
+      const len = Math.sqrt(len2);
+      const nx = sx / len;
+      const ny = sy / len;
+      const vn = vx[i] * nx + vy[i] * ny;
+      if (vn < 0) {
+        vx[i] -= vn * nx;
+        vy[i] -= vn * ny;
+      }
+    }
+
     // --- walls, sleep ------------------------------------------------------
     const left = r;
     const right = width - r;
@@ -567,6 +618,17 @@ export class GrainWorld {
       const material = MATERIALS[kind[i]];
       const bouncy = (speed: number): number =>
         Math.abs(speed) > BOUNCE_SPEED ? material.restitution : 0;
+
+      // Rolling resistance: only for a grain that is already slow and touching
+      // something, so a falling stream is untouched and a lone grain rolling
+      // across a flat floor eventually stops instead of orbiting for ever.
+      if (touched[i] === 1) {
+        const speed = Math.abs(vx[i]) + Math.abs(vy[i]);
+        if (speed < ROLL_SPEED) {
+          vx[i] *= material.rolling;
+          vy[i] *= material.rolling;
+        }
+      }
 
       if (x[i] < left) {
         x[i] = left;
@@ -853,6 +915,8 @@ export class GrainWorld {
     x[i] = gx + normalX * depth;
     y[i] = gy + normalY * depth;
     this.touched[i] = 1;
+    this.supX[i] += normalX * depth;
+    this.supY[i] += normalY * depth;
 
     // Velocity: split the slip against the surface, reflect the normal part
     // with restitution, kill a fraction of the tangent with friction, and add

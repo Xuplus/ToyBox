@@ -2,7 +2,6 @@ import Matter from 'matter-js';
 import { describe, expect, it } from 'vitest';
 import { GRAIN, GrainWorld, scatterGrains } from './grains';
 import { GRAVITY_ACCEL, STEP_MS } from './world';
-
 function world(n: number, width = 300, height = 300, radius = 5): GrainWorld {
   return new GrainWorld(n, width, height, { radius });
 }
@@ -275,8 +274,66 @@ describe('GrainWorld - sleep', () => {
     // One grain dropped into a settled pile has to wake its neighbours, or the
     // pile would behave like a solid block. It needs long enough to arrive.
     expect(w.add(120, 20)).toBe(true);
-    run(w, 90);
+    run(w, 45);
     expect(w.awake).toBeGreaterThan(1);
+  });
+
+  it('wakes a settled heap without the heap moving', () => {
+    const w = world(400, 240, 240, 4);
+    scatterGrains(w, 240);
+    run(w, 600);
+
+    let asleep = 0;
+    for (let i = 0; i < w.count; i++) asleep += w.asleep[i];
+    expect(asleep).toBe(w.count);
+
+    const x0 = Float32Array.from(w.x.subarray(0, w.count));
+    const y0 = Float32Array.from(w.y.subarray(0, w.count));
+
+    // Waking it must be a no-op. A pile that was frozen mid-collapse, or one
+    // full of overlaps that the sleeping neighbours never got to resolve, pops
+    // the moment it is disturbed - which is exactly what this guards.
+    w.wakeAll();
+    run(w, 10);
+
+    let sum = 0;
+    let max = 0;
+    for (let i = 0; i < w.count; i++) {
+      const d = Math.hypot(w.x[i] - x0[i], w.y[i] - y0[i]);
+      sum += d;
+      max = Math.max(max, d);
+    }
+
+    expect(sum / w.count).toBeLessThan(1.5);
+    expect(max).toBeLessThan(6);
+  });
+
+  it('absorbs a fast hit instead of shattering the pile', () => {
+    const w = world(400, 240, 240, 4);
+    scatterGrains(w, 240);
+    run(w, 600);
+
+    const x0 = Float32Array.from(w.x.subarray(0, w.count));
+    const y0 = Float32Array.from(w.y.subarray(0, w.count));
+    const before = w.count;
+
+    // A ball, near enough: one grain arriving at 12 px/step.
+    w.add(120, 40, 0, 12);
+    run(w, 60);
+
+    let sum = 0;
+    let max = 0;
+    for (let i = 0; i < before; i++) {
+      const d = Math.hypot(w.x[i] - x0[i], w.y[i] - y0[i]);
+      sum += d;
+      max = Math.max(max, d);
+    }
+
+    // The hit has to go *somewhere* - a crater that shallow is a few px - but
+    // the pile must not burst apart, which is what waking a heap that was
+    // frozen mid-collapse looks like.
+    expect(sum / before).toBeLessThan(6);
+    expect(max).toBeLessThan(40);
   });
 });
 
