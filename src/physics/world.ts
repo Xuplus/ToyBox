@@ -3,8 +3,22 @@ import Matter from 'matter-js';
 /** Fixed simulation step. Matter is tuned for 60 Hz; anything else changes feel. */
 export const STEP_MS = 1000 / 60;
 
+/**
+ * Matter's default `gravity.scale`: the gravitational *force* per unit of mass.
+ * `Engine._bodiesApplyGravity` adds `mass * gravity.y * scale` to every body.
+ */
+export const GRAVITY_SCALE = 0.001;
+
+/**
+ * The same gravity expressed as an acceleration, in px per step squared. Matter
+ * integrates a force as `force / mass * STEP_MS^2`, so one step of gravity adds
+ * `GRAVITY_SCALE * STEP_MS^2` to the velocity - which is the number the granular
+ * layer has to use to fall at the same rate as everything else in the box.
+ */
+export const GRAVITY_ACCEL = GRAVITY_SCALE * STEP_MS * STEP_MS;
+
 /** Wall thickness. Walls sit OUTSIDE the visible area, so the canvas edge is
- *  exactly the inside of the box — nothing can leave and nothing is drawn over. */
+ *  exactly the inside of the box - nothing can leave and nothing is drawn over. */
 const WALL = 80;
 
 export interface World {

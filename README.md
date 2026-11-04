@@ -2,9 +2,10 @@
 
 A box of little physics toys. Drop in balls with different weight and bounce,
 stack crates, shatter glass, ride conveyor belts, and knock out a tune on the
-musical blocks. Drag anything, throw it, watch what happens. A ball spout keeps
-filling the box on its own, and the playfield can be zoomed out up to 2.5× when
-you want to fit more in.
+musical blocks. Pour sand and water from the hoppers and watch sand bury a crate
+and water find its own level. Drag anything, throw it, watch what happens. A
+ball spout keeps filling the box on its own, and the playfield can be zoomed out
+up to 2.5× when you want to fit more in.
 
 It runs entirely in the browser — no server, no accounts, nothing stored, no
 image or sound files (the audio is synthesised).
@@ -41,12 +42,13 @@ npm run bench -- --url http://127.0.0.1:4173/ --spawners 6 --seconds 80
 npm run bench -- --url "http://127.0.0.1:4173/?render=2d" --sizes 0,2000
 ```
 
-Roughly: **it holds 60 fps up to ~1350 bodies** in a 1416×672 box, and physics
-is what costs. Drawing goes to the GPU as a handful of instanced draw calls
-(`src/engine/gl/`), so the painter takes 0.06–0.5 ms whatever is in the box —
-against 8.6–12.6 ms for the canvas 2D path at a few thousand bodies, which is
-kept as the fallback (`?render=2d`). Six spouts take about a minute to fill the
-box that far.
+Roughly: **it holds 60 fps up to ~2000 rigid bodies** in a 1416×672 box, and
+physics is what costs. Drawing goes to the GPU as a handful of instanced draw
+calls (`src/engine/gl/`), so the painter takes 0.06–0.5 ms whatever is in the box
+— against 8.6–12.6 ms for the canvas 2D path at a few thousand bodies, which is
+kept as the fallback (`?render=2d`). The granular layer is cheaper still: 8,000
+grains all in motion is 1.7 ms of the frame, and the same 8,000 once they have
+settled is 0.2 ms.
 
 The numbers, the method and the caveats (headless has no vsync; `draw-ms` under
 WebGL is CPU submission, not GPU work) are in
@@ -54,9 +56,11 @@ WebGL is CPU submission, not GPU work) are in
 
 For the next order of magnitude — what to cache, which corner of the simulation
 to cut, and why "tens of thousands of rigid bodies at 60 Hz" is not a thing in
-a browser — see the same file. It also covers the granular solver prototype in
-[`src/physics/grains.ts`](./src/physics/grains.ts), which simulates circles
-5–12× cheaper than the rigid-body engine and is the next thing to build on.
+a browser — see the same file. It also covers the granular layer in
+[`src/physics/grains.ts`](./src/physics/grains.ts): sand and water live in typed
+arrays, cost ~0.2 µs per *moving* grain, and go to sleep when they settle, so a
+dune is nearly free. What limits the grains is how densely they are packed, not
+how many of them there are.
 
 ## Add a toy
 

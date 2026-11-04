@@ -1,14 +1,14 @@
-// Scene → instance buffers.
+// Scene to instance buffers.
 //
 // This is the whole of the old `render.ts` body, turned inside out: instead of
-// issuing canvas calls, it writes numbers into flat arrays. It is pure — the
+// issuing canvas calls, it writes numbers into flat arrays. It is pure - the
 // only things it touches are the scene, the toy metadata and the buffer
-// objects — so the packing (which pattern a crate gets, how many instances a
+// objects - so the packing (which pattern a crate gets, how many instances a
 // belt emits, where a note's label lands) is unit-testable without a GPU.
 
 import type Matter from 'matter-js';
 import { shadeRgb, toRgb, type RGB } from '../../lib/color';
-import type { GrainWorld } from '../../physics/grains';
+import { GRAIN, MATERIALS, type GrainWorld } from '../../physics/grains';
 import { metaOf } from '../../toys/meta';
 import type { ToyMeta } from '../../toys/types';
 import type { Ghost, Scene } from '../scene';
@@ -25,15 +25,27 @@ import {
 } from './instances';
 import type { LabelLookup } from './labels';
 
-/** Sand-coloured grains, so the granular layer reads as its own material. */
-export const GRAIN_COLOR = '#e0a458';
-
 const K = 1 / 255;
 
 /** Outlines every ball gets: `shade(color, -0.55)`. */
 const BALL_BORDER = -0.55;
 
-/** One reusable set of buffers — reset, refilled and uploaded every frame. */
+/** Fill of every grain, per material, ready to write into an instance. */
+const GRAIN_FILL = MATERIALS.map((material) => {
+  const [r, g, b] = toRgb(material.color);
+  return [r * K, g * K, b * K, material.alpha];
+});
+
+/** How strong the shared rim is on each material; 0 merges water into a mass. */
+const GRAIN_RIM = MATERIALS.map((material) => material.border);
+
+/**
+ * Outline + halo colour every grain shares, as a constant vertex attribute. The
+ * per-instance float scales it: sand keeps the rim, water switches it off.
+ */
+export const GRAIN_BORDER: RGB = shadeRgb(toRgb(MATERIALS[GRAIN.sand].color), BALL_BORDER);
+
+/** One reusable set of buffers - reset, refilled and uploaded every frame. */
 export class SceneBuffers {
   readonly dots = new Instances(DOT_STRIDE, 4096);
   readonly circles = new Instances(DOT_STRIDE);
@@ -58,12 +70,9 @@ export class SceneBuffers {
   }
 }
 
-/** Outline + halo colour every grain shares, as a generic vertex attribute. */
-export const GRAIN_BORDER: RGB = shadeRgb(toRgb(GRAIN_COLOR), BALL_BORDER);
-
 /**
  * Fill one frame's buffers. `labels` may be null when the atlas could not be
- * built — the note bodies still draw, they just arrive without their name.
+ * built - the note bodies still draw, they just arrive without their name.
  */
 export function packScene(
   out: SceneBuffers,
@@ -95,6 +104,9 @@ export function packScene(
       case 'spawner':
         packSpawner(out, body, meta, time, glow);
         break;
+      case 'source':
+        packSource(out, body, meta, time, glow);
+        break;
       default:
         packBlock(out, body, meta, glow);
         break;
@@ -107,9 +119,9 @@ export function packScene(
 // --- grains --------------------------------------------------------------
 
 /**
- * The granular layer: position and radius, nothing else. All grains share a
- * colour *and* an outline, which the renderer supplies as a constant vertex
- * attribute — so 20,000 grains cost 7 floats each, not 13.
+ * The granular layer: position, radius, material. The outline colour is a
+ * constant vertex attribute, so a grain costs eight floats instead of thirteen
+ * - which at twenty thousand grains is most of a millisecond of upload.
  */
 function packGrains(dots: Instances, grains: GrainWorld): void {
   const count = grains.count;
@@ -118,20 +130,21 @@ function packGrains(dots: Instances, grains: GrainWorld): void {
   dots.reserve(count);
   const d = dots.data;
   const radius = grains.options.radius;
-  const color = toRgb(GRAIN_COLOR);
-  const r = color[0] * K;
-  const g = color[1] * K;
-  const b = color[2] * K;
+  const kind = grains.kind;
+  const x = grains.x;
+  const y = grains.y;
 
   let at = dots.count * DOT_STRIDE;
   for (let i = 0; i < count; i++) {
-    d[at + DOT.x] = grains.x[i];
-    d[at + DOT.y] = grains.y[i];
+    const fill = GRAIN_FILL[kind[i]];
+    d[at + DOT.x] = x[i];
+    d[at + DOT.y] = y[i];
     d[at + DOT.radius] = radius;
-    d[at + DOT.color] = r;
-    d[at + DOT.color + 1] = g;
-    d[at + DOT.color + 2] = b;
-    d[at + DOT.color + 3] = 1;
+    d[at + DOT.color] = fill[0];
+    d[at + DOT.color + 1] = fill[1];
+    d[at + DOT.color + 2] = fill[2];
+    d[at + DOT.color + 3] = fill[3];
+    d[at + DOT.border] = GRAIN_RIM[kind[i]];
     at += DOT_STRIDE;
   }
   dots.count += count;
@@ -150,6 +163,7 @@ function pushCircle(
   borderAlpha: number,
   glow = 0,
   dash = 0,
+  rim = 1,
 ): void {
   const at = out.circles.slot();
   const d = out.circles.data;
@@ -160,6 +174,7 @@ function pushCircle(
   d[at + DOT.color + 1] = color[1] * K;
   d[at + DOT.color + 2] = color[2] * K;
   d[at + DOT.color + 3] = fillAlpha;
+  d[at + DOT.border] = rim;
 
   const st = out.styles.slot();
   const s = out.styles.data;
@@ -579,11 +594,97 @@ function packSpawner(
   }
 }
 
+// --- granular sources ----------------------------------------------------
+
+/** The hopper housing. Fixed slate, so the material colour is the only signal. */
+const SOURCE_HOUSING = '#333b4c';
+
+/**
+ * A sand or water hopper: a dark housing, a mouth along the bottom edge in the
+ * material's own colour, and a short stream falling out of it. The stream runs
+ * on its own clock rather than the pour rate - at 340 grains a second the real
+ * interval is three milliseconds, far too fast to read.
+ */
+function packSource(
+  out: SceneBuffers,
+  body: Matter.Body,
+  meta: ToyMeta,
+  time: number,
+  glow: number,
+): void {
+  const { w, h } = meta;
+  const housing = toRgb(SOURCE_HOUSING);
+  const accent = toRgb(meta.accent);
+
+  placeRect(
+    out,
+    body,
+    0,
+    0,
+    rect({
+      x: 0,
+      y: 0,
+      halfW: w / 2,
+      halfH: h / 2,
+      radius: 9,
+      color: housing,
+      shadeTop: 0.26,
+      shadeBottom: -0.4,
+      border: shadeRgb(housing, -0.6),
+      borderAlpha: 1,
+      borderW: 1.5,
+      pattern: PATTERN.spawner,
+      patternRgb: accent,
+      glow,
+    }),
+  );
+
+  // The mouth: a bright slot along the bottom edge, where the material leaves.
+  placeRect(
+    out,
+    body,
+    0,
+    h / 2 - 5,
+    rect({
+      x: 0,
+      y: 0,
+      halfW: w * 0.34,
+      halfH: 5,
+      radius: 5,
+      color: accent,
+      alpha: 0.92,
+      glow,
+    }),
+  );
+
+  // Falling stream. Four dots on a looping stagger, fading as they fall.
+  const period = 380;
+  const phase = (((time % period) + period) % period) / period;
+  const c = Math.cos(body.angle);
+  const s = Math.sin(body.angle);
+
+  for (let i = 0; i < 4; i++) {
+    const t = (phase + i / 4) % 1;
+    const localY = h / 2 + t * h * 1.15;
+    pushCircle(
+      out,
+      body.position.x - localY * s,
+      body.position.y + localY * c,
+      3.4 - t * 1.7,
+      accent,
+      0.85 * (1 - t * 0.6),
+      null,
+      0,
+      glow,
+    );
+  }
+}
+
 // --- polygons ------------------------------------------------------------
 
 /**
  * Wedges and anything else built from vertices. A triangle fan for the fill,
- * then a quad per edge for the outline, then one lit edge for the bevel — the
+ * then a quad per edge for the outline, then one lit edge for the bevel - the
  * canvas painter strokes paths, and there is no line primitive here.
  */
 function packPoly(target: Instances, body: Matter.Body, meta: ToyMeta): void {
@@ -685,6 +786,7 @@ function packGhost(out: SceneBuffers, ghost: Ghost): void {
     d[at + DOT.color + 1] = color[1] * K;
     d[at + DOT.color + 2] = color[2] * K;
     d[at + DOT.color + 3] = 0.06;
+    d[at + DOT.border] = 1;
 
     const st = out.ghostStyle.slot();
     const s = out.ghostStyle.data;

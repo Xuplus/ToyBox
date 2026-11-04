@@ -67,10 +67,13 @@ bundle served by Caddy**, and the `/toybox` prefix is baked into the build via
   both.
 - `src/lib/` — `frame-meter.ts` (rolling window of frame durations → fps, p95,
   mean) and `color.ts` (shade/alpha). Pure, no DOM.
-- `src/physics/grains.ts` — the **granular layer prototype**: circles in
-  `Float32Array`s, counting-sort uniform grid, relaxation passes. No rotation,
-  so it is for balls only; 5–12× cheaper per body than Matter. Reached through
-  `?bench` (`__toybox.grains(n)`), not yet wired into the toy.
+- `src/physics/grains.ts` — the **granular layer**: sand and water. Circles in
+  `Float32Array`s, counting-sort uniform grid, relaxation passes, no rotation, so
+  it is for piles rather than shapes. 5–12× cheaper per body than Matter, and a
+  settled pile sleeps, so it is also cheaper than that once it stops.
+  `MATERIALS` at the top of the file is the only description of what each
+  material is: colour, alpha, rim, friction, restitution, cohesion, sleep. Both
+  painters read it, so a new material is one entry.
 - `src/engine/sprites.ts` — pre-rendered ball sprites, **canvas 2D path only**.
   Drawing a ball from gradients costs ~4× a blit; at a thousand balls that is a
   third of the frame. The WebGL path shades circles in a fragment shader and
@@ -139,6 +142,15 @@ Always run `npm run typecheck` and `npm run test` after changes.
 - **Never add a `drawImage`/gradient to the hot path.** If it needs per-frame
   geometry, give it an instance and a `pattern` id instead. The whole point of
   the instanced painter is that the cost of a body is a few float writes.
+- **The granular layer is a second engine, not a second world.** `ToyBoxEngine`
+  owns one `GrainWorld`; it is created on first use and **survives every resize**
+  (`resize()` keeps the grains). Grains never become Matter bodies and Matter
+  bodies never become grains — they meet through `GrainCollider`, which
+  `Matter.Body` satisfies structurally. The solver must not import Matter.
+- **A grain's velocity is not a measure of rest.** A packed heap churns at
+  ~2 px/step while going nowhere, so sleep is decided on how far a grain moved
+  over a window (see `SLEEP_WINDOW`/`SLEEP_DRIFT` in `grains.ts`). Do not
+  "simplify" that to a velocity threshold: the heap will never sleep.
 - **Shared header UX.** Top bar in normal flow — home (`🏠`, `href="/"` → the
   `elnuevos.es` root) + `🧰` title on the left, controls and language on the
   right. Never absolutely positioned. Mirrors the sibling games.
@@ -150,9 +162,10 @@ Always run `npm run typecheck` and `npm run test` after changes.
 ## Adding a toy
 
 1. Add an entry in `src/toys/catalog.ts` (`makeBall` / `makeBlock` / `makeBelt` /
-   `makeSpawner` cover the current shapes) and add it to a `PALETTE_GROUPS` list.
-   A non-rectangular body sets `shape: 'poly'` on its metadata and is drawn from
-   its Matter vertices (see `ramp`).
+   `makeSpawner` / `makeSource` cover the current shapes) and add it to a
+   `PALETTE_GROUPS` list. A non-rectangular body sets `shape: 'poly'` on its
+   metadata and is drawn from its Matter vertices (see `ramp`). A pouring hopper
+   is `makeSource` plus a `GrainMaterial` in `MATERIALS`.
 2. Add its `toy_<id>` name to both dictionaries in `src/i18n.ts`.
 3. Add a test in `src/toys/catalog.test.ts` only if it behaves unusually (the
    existing loops already build every registered toy).
@@ -161,19 +174,20 @@ Always run `npm run typecheck` and `npm run test` after changes.
 
 Working: gravity, dragging/throwing with a soft constraint, spawning by click,
 delete tool and right-click delete, four balls, five blocks (including a static
-wedge ramp), breakable glass and brick, two conveyor belts, a ball spout, pitched
-note blocks (C major pentatonic, cycling), pause, mute, clear, EN/ES, responsive
-palette, a live FPS/bodies readout, and the playfield size control.
+wedge ramp), breakable glass and brick, two conveyor belts, a ball spout, sand
+and water hoppers that pour into the box and are drawn by the same renderer,
+pitched note blocks (C major pentatonic, cycling), pause, mute, clear, EN/ES,
+responsive palette, a live FPS/bodies readout, and the playfield size control.
 
 Performance is measured, not estimated: `PERFORMANCE.md` has the curves and
-`npm run bench` reproduces them. The short version: **the painter is no longer
-the wall** — the WebGL2 path draws anything from 500 to 7,747 bodies in
-0.06–0.5 ms, against 8.6–12.6 ms for canvas 2D at the top of that range — so the
-physics step is the only thing left in the 16.7 ms budget, and that is what
-`est-60hz` in the bench output tells you. The next lever is the granular layer
-(`physics/grains.ts`), which is the only way past ~2,000 bodies.
+`npm run bench` reproduces them. The short version: **neither painter is the
+wall** — WebGL2 draws anything from 500 to 20,000 bodies in 0.06–0.5 ms — and
+the two ceilings are 9 µs per rigid body (matter, ~2,000 of them at 60 Hz) and
+packing density for grains (8,000 moving grains is 1.7 ms; a settled pile is
+free; a box packed past ~60% never settles at all).
 
 Ideas still open (see `PLAN.md §8`): saving a scene in `localStorage`, a
-"shake" button, funnels/dominoes as extra toy families, a sound-block octave
-toggle, better mobile affordances (tap-to-place ghost), and the dashboard card +
-`deploy.config.json` entry.
+"shake" button, funnels/dominoes as extra toy families, ropes and explosives on
+Matter constraints, a sound-block octave toggle, better mobile affordances
+(tap-to-place ghost), a worker to buy a frame of headroom, and the dashboard
+card + `deploy.config.json` entry.

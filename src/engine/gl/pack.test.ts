@@ -1,14 +1,14 @@
 import type Matter from 'matter-js';
 import { describe, expect, it } from 'vitest';
 import { toRgb, shadeRgb } from '../../lib/color';
-import { GrainWorld, scatterGrains } from '../../physics/grains';
+import { GRAIN, GrainWorld, MATERIALS, scatterGrains } from '../../physics/grains';
 import { NOTE_H, TOYS, toyById } from '../../toys/catalog';
 import type { SpawnContext, ToyId } from '../../toys/types';
 import { metaOf, setMeta } from '../../toys/meta';
 import type { Scene } from '../scene';
 import { CIRCLE_STYLE, DOT, DOT_STRIDE, Instances, PATTERN, RECT, SPRITE } from './instances';
 import type { LabelCell, LabelLookup } from './labels';
-import { GRAIN_COLOR, packScene, SceneBuffers } from './pack';
+import { packScene, SceneBuffers } from './pack';
 
 const K = 1 / 255;
 
@@ -267,7 +267,7 @@ describe('packScene — spouts', () => {
 });
 
 describe('packScene — grains', () => {
-  it('packs one dot per grain, in the shared sand colour', () => {
+  it('packs one dot per grain, in the sand colour and with its rim', () => {
     const world = new GrainWorld(6, 200, 200, { radius: 6 });
     scatterGrains(world, 6);
     const out = pack([], { grains: world });
@@ -279,12 +279,34 @@ describe('packScene — grains', () => {
     expect(d[DOT.x]).toBeCloseTo(world.x[0], 5);
     expect(d[DOT.y]).toBeCloseTo(world.y[0], 5);
     expect(d[DOT.radius]).toBe(6);
-    expect(d[DOT.color]).toBeCloseTo(toRgb(GRAIN_COLOR)[0] * K, 5);
+    expect(d[DOT.color]).toBeCloseTo(toRgb(MATERIALS[GRAIN.sand].color)[0] * K, 5);
     expect(d[DOT.color + 3]).toBe(1);
+    expect(d[DOT.border]).toBe(MATERIALS[GRAIN.sand].border);
 
     // Grains never allocate per-instance style records.
     expect(out.circles.count).toBe(0);
     expect(out.styles.count).toBe(0);
+  });
+
+  it('gives water its own colour, alpha and no rim', () => {
+    const world = new GrainWorld(3, 200, 200, { radius: 5 });
+    world.add(50, 50, 0, 0, GRAIN.water);
+    world.add(60, 50, 0, 0, GRAIN.water);
+    world.add(70, 50, 0, 0, GRAIN.sand);
+
+    const out = pack([], { grains: world });
+    const d = out.dots.data;
+    const water = MATERIALS[GRAIN.water];
+
+    expect(d[DOT.color]).toBeCloseTo(toRgb(water.color)[0] * K, 5);
+    expect(d[DOT.color + 3]).toBeCloseTo(water.alpha, 5);
+    expect(d[DOT.border]).toBe(0);
+
+    // ...and sand in the same buffer keeps its rim.
+    const last = 2 * DOT_STRIDE;
+    expect(d[last + DOT.border]).toBe(MATERIALS[GRAIN.sand].border);
+    // Two materials, one draw call: still nothing in the ball buffers.
+    expect(out.circles.count).toBe(0);
   });
 
   it('does not touch the ball buffers', () => {

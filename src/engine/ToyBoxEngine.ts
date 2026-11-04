@@ -2,7 +2,14 @@ import Matter from 'matter-js';
 import type { Synth } from '../audio/synth';
 import { FrameMeter } from '../lib/frame-meter';
 import { carryBodies } from '../physics/conveyor';
-import { GrainWorld, scatterGrains } from '../physics/grains';
+import {
+  GRAIN,
+  GRAIN_FORCE,
+  GrainWorld,
+  scatterGrains,
+  type GrainCollider,
+  type GrainMaterial,
+} from '../physics/grains';
 import { shardGrid, shardLayout } from '../physics/shatter';
 import { planEmissions } from '../physics/spawner';
 import { clampIntoBounds, createWorld, removeBody, resizeWorld, STEP_MS } from '../physics/world';
@@ -18,6 +25,12 @@ export type Tool = 'drag' | 'delete' | ToyId;
  *  get here; the measured frame cost at 2000 bodies is roughly 40 fps on a
  *  60 Hz display, which is slow but still interactive, so the tab survives. */
 const MAX_BODIES = 2000;
+/** Hard cap on grains. A source nobody turns off is the only way here, and the
+ *  ceiling is memory rather than frame time: settled grains sleep, so a full
+ *  box of sand is close to free. */
+const MAX_GRAINS = 12000;
+/** Radius of the delete tool's bite into a sand pile, in world px. */
+const ERASE_RADIUS = 22;
 /** Impact speed (px/step) below which a note block stays quiet. */
 const NOTE_THRESHOLD = 1.2;
 /** Minimum gap between two sounds from the same block, in ms. */
@@ -50,7 +63,11 @@ export interface PerfStats {
   drawMs: number;
   bodies: number;
   toys: number;
-  /** which painter is running — `webgl` unless the browser refused one */
+  /** grains in the box (a subset of `bodies`) */
+  grains: number;
+  /** how many of those moved last step - the part that costs anything */
+  grainsAwake: number;
+  /** which painter is running - `webgl` unless the browser refused one */
   renderer: Painter['kind'];
 }
 
@@ -58,7 +75,7 @@ export interface EngineCallbacks {
   /** Fired when the toy count changes. `toys` excludes shards, `bodies` is
    *  everything in the box (used to tell "empty" from "only debris"). */
   onCount: (toys: number, bodies: number) => void;
-  /** Fired on the first user gesture — used to dismiss the hint. */
+  /** Fired on the first user gesture - used to dismiss the hint. */
   onFirstInteraction: () => void;
   /** Fired every `STAT_EVERY` ms with the performance readout. */
   onStats: (stats: PerfStats) => void;
@@ -69,6 +86,16 @@ interface DragState {
   /** null for static bodies, which are moved directly instead */
   constraint: Matter.Constraint | null;
   offset: Matter.Vector;
+}
+
+/**
+ * A rigid body, in the shape the granular layer expects. The pool is rebuilt
+ * in place every step - the wrapped objects are reused, so the solver never
+ * sees an allocation.
+ */
+interface BodyCollider extends GrainCollider {
+  body: Matter.Body;
+  surface: { x: number; y: number };
 }
 
 export class ToyBoxEngine {
@@ -83,7 +110,7 @@ export class ToyBoxEngine {
   private cursor = '';
   /** css size of the canvas */
   private view = { w: 1, h: 1 };
-  /** world px per css px — the playfield control zooms the box, not the canvas */
+  /** world px per css px - the playfield control zooms the box, not the canvas */
   private scale = 1;
   /** simulated box size, `view * scale` */
   private size = { w: 1, h: 1 };
@@ -101,8 +128,13 @@ export class ToyBoxEngine {
   /** device px per world px, i.e. the canvas transform scale */
   private pixelRatio = 1;
   private sprites = true;
-  /** Experimental granular layer — see `physics/grains.ts` and `spawnGrains`. */
+  /** The granular layer. Created on first use, and it survives every resize. */
   private grainWorld: GrainWorld | null = null;
+  /** Rigid bodies, wrapped once each and refilled every step. */
+  private readonly colliderPool: BodyCollider[] = [];
+  private readonly colliderView: BodyCollider[] = [];
+  /** true while the delete tool is being dragged through the box */
+  private erasing = false;
 
   constructor(
     private readonly canvas: HTMLCanvasElement,
@@ -197,6 +229,8 @@ export class ToyBoxEngine {
 
     this.size = { w: worldW, h: worldH };
     resizeWorld(this.world, worldW, worldH);
+    // The grains keep their positions; the box they are in changed shape.
+    this.grainWorld?.resize(worldW, worldH);
   }
 
   // --- public controls ---------------------------------------------------
@@ -217,25 +251,38 @@ export class ToyBoxEngine {
   clear(): void {
     this.endDrag();
     for (const body of [...this.bodies]) this.remove(body);
-    this.grainWorld = null;
+    this.grainWorld?.clear();
     this.noteCounter = 0;
     this.emitCount();
   }
 
   /**
-   * Experimental: replace the box with `n` grains (see `physics/grains.ts`).
-   * This is the granular layer prototype — thousands of non-rotating circles
-   * for the cost of a few hundred Matter bodies. Gated behind `?bench`.
+   * The granular layer, created on first use at the current box size. Passing a
+   * different radius rebuilds it, because the uniform grid is sized from it.
    */
-  spawnGrains(n: number, radius = 5): number {
-    const world = new GrainWorld(Math.max(1, n), this.size.w, this.size.h, { radius });
-    const added = scatterGrains(world, n);
+  private ensureGrains(radius?: number): GrainWorld {
+    const existing = this.grainWorld;
+    if (existing && (radius === undefined || existing.options.radius === radius)) return existing;
+
+    const world = new GrainWorld(MAX_GRAINS, this.size.w, this.size.h, { radius });
     this.grainWorld = world;
+    return world;
+  }
+
+  /**
+   * Benchmark helper: fill the box with `n` grains of one material, replacing
+   * whatever was there. Reached through `?bench` (`__toybox.grains(n)`), not by
+   * playing - the toy pours its grains from a source instead.
+   */
+  spawnGrains(n: number, radius = 5, kind: GrainMaterial = GRAIN.sand): number {
+    const world = this.ensureGrains(radius);
+    world.clear();
+    const added = scatterGrains(world, n, 1, kind);
     this.emitCount();
     return added;
   }
 
-  /** Suppress the starter scene — a benchmark wants a known box. */
+  /** Suppress the starter scene - a benchmark wants a known box. */
   skipSeed(): void {
     this.seeded = true;
   }
@@ -307,10 +354,136 @@ export class ToyBoxEngine {
 
   private step(): void {
     this.spawnFromSpawners(STEP_MS);
+    this.pourSources(STEP_MS);
     carryBodies(this.bodies);
     Matter.Engine.update(this.world.engine, STEP_MS);
     this.evictEscaped();
-    this.grainWorld?.step();
+    this.stepGrains();
+  }
+
+  // --- granular layer ----------------------------------------------------
+
+  /**
+   * One grain step, then hand the bodies back the weight that rested on them.
+   *
+   * Matter clears `force`/`torque` at the end of every update, so this load is
+   * integrated on the *next* step - a 16 ms delay that nothing can see, in
+   * exchange for not having to run the grain solver inside Matter's step.
+   */
+  private stepGrains(): void {
+    const grains = this.grainWorld;
+    if (!grains) return;
+
+    this.buildColliders();
+    grains.step(this.colliderView);
+
+    const load = GRAIN_FORCE;
+    for (let i = 0; i < this.colliderView.length; i++) {
+      const body = this.colliderView[i].body;
+      if (body.isStatic) continue;
+
+      const fx = grains.loadFx[i];
+      const fy = grains.loadFy[i];
+      const torque = grains.loadTorque[i];
+      if (fx === 0 && fy === 0 && torque === 0) continue;
+
+      body.force.x += fx * load;
+      body.force.y += fy * load;
+      body.torque += torque * load;
+    }
+  }
+
+  /**
+   * Wrap every body for the granular layer. The pool is indexed by position in
+   * `this.bodies`, so a steady box reuses the same wrapper objects for ever.
+   */
+  private buildColliders(): void {
+    const view = this.colliderView;
+    const pool = this.colliderPool;
+    view.length = 0;
+
+    for (const body of this.bodies) {
+      let collider = pool[view.length];
+      if (!collider) {
+        collider = {
+          body,
+          vertices: body.vertices,
+          bounds: body.bounds,
+          position: body.position,
+          isStatic: body.isStatic,
+          mass: body.mass,
+          velocity: body.velocity,
+          surface: { x: 0, y: 0 },
+        };
+        pool[view.length] = collider;
+      }
+
+      collider.body = body;
+      collider.vertices = body.vertices;
+      collider.bounds = body.bounds;
+      collider.position = body.position;
+      collider.isStatic = body.isStatic;
+      collider.mass = body.mass;
+      collider.velocity = body.velocity;
+
+      const belt = metaOf(body)?.belt;
+      collider.surface.x = belt ? belt.dir * belt.speed : 0;
+      collider.surface.y = 0;
+
+      view.push(collider);
+    }
+  }
+
+  /**
+   * Release what the sources owe this step. Emission is capped twice: a stall
+   * must not dump a bucket in one step, and the box must not overflow.
+   */
+  private pourSources(dt: number): void {
+    for (const body of this.bodies) {
+      const meta = metaOf(body);
+      const source = meta?.source;
+      if (!source || !meta) continue;
+
+      source.acc += (source.perSecond * dt) / 1000;
+      let due = Math.floor(source.acc);
+      if (due <= 0) continue;
+      source.acc -= due;
+      if (due > 64) due = 64;
+
+      const grains = this.ensureGrains();
+      if (grains.count >= grains.capacity) {
+        source.acc = 0;
+        continue;
+      }
+      due = Math.min(due, grains.capacity - grains.count);
+
+      // The mouth is the bottom edge of the hopper: one grain radius clear of
+      // its own collider, so a fresh grain is never born inside the housing.
+      const radius = grains.options.radius;
+      const offset = meta.h / 2 + radius + 1;
+      const cos = Math.cos(body.angle);
+      const sin = Math.sin(body.angle);
+      const mouthX = body.position.x - offset * sin;
+      const mouthY = body.position.y + offset * cos;
+
+      for (let i = 0; i < due; i++) {
+        grains.add(
+          mouthX + (Math.random() - 0.5) * 2 * source.spread,
+          mouthY + Math.random() * 3,
+          (Math.random() - 0.5) * 0.6,
+          source.speed + Math.random() * 0.4,
+          source.material,
+        );
+      }
+      source.poured += due;
+    }
+  }
+
+  /** Erase the sand under the delete tool. Returns how many grains went. */
+  private eraseAt(point: Matter.Vector): number {
+    const grains = this.grainWorld;
+    if (!grains || grains.count === 0) return 0;
+    return grains.removeIn(point.x, point.y, ERASE_RADIUS);
   }
 
   /**
@@ -461,6 +634,9 @@ export class ToyBoxEngine {
 
   private remove(body: Matter.Body): void {
     if (this.drag?.body === body) this.endDrag();
+    // Sand resting on this body has to fall when it goes.
+    const { min, max } = body.bounds;
+    this.grainWorld?.wakeIn(min.x, min.y, max.x, max.y);
     removeBody(this.world, body);
     const index = this.bodies.indexOf(body);
     if (index >= 0) this.bodies.splice(index, 1);
@@ -481,7 +657,7 @@ export class ToyBoxEngine {
     this.emitCount();
   }
 
-  /** Build a toy and add its bodies. No count callback — see `spawn`. */
+  /** Build a toy and add its bodies. No count callback - see `spawn`. */
   private place(toy: ToyDef, at: Matter.Vector, velocity?: Matter.Vector): void {
     const built = toy.build(at.x, at.y, { noteIndex: this.noteCounter++ });
     const bodies = Array.isArray(built) ? built : [built];
@@ -522,6 +698,7 @@ export class ToyBoxEngine {
   /** Current cost of the box: frame rate plus where the milliseconds go. */
   stats(): PerfStats {
     const frame = this.meter.snapshot();
+    const grains = this.grainWorld;
     let toys = 0;
     for (const body of this.bodies) if (!isShard(body)) toys++;
 
@@ -531,13 +708,15 @@ export class ToyBoxEngine {
       frameMs: frame.frameMs,
       physicsMs: this.physicsMs,
       drawMs: this.drawMs,
-      bodies: this.bodies.length + (this.grainWorld?.count ?? 0),
+      bodies: this.bodies.length + (grains?.count ?? 0),
       toys,
+      grains: grains?.count ?? 0,
+      grainsAwake: grains?.awake ?? 0,
       renderer: this.painter.kind,
     };
   }
 
-  /** Forget the timing window — call before measuring. */
+  /** Forget the timing window - call before measuring. */
   resetStats(): void {
     this.meter.reset();
     this.statAcc = 0;
@@ -569,8 +748,9 @@ export class ToyBoxEngine {
   }
 
   private emitCount(): void {
+    // Grains count as bodies, not as toys: twelve thousand grains are one pile.
     const grains = this.grainWorld?.count ?? 0;
-    const toys = this.bodies.filter((body) => !isShard(body)).length + grains;
+    const toys = this.bodies.filter((body) => !isShard(body)).length;
     this.callbacks.onCount(toys, this.bodies.length + grains);
   }
 
@@ -593,6 +773,10 @@ export class ToyBoxEngine {
       if (hit) {
         this.remove(hit);
         this.emitCount();
+      } else {
+        // No body under the pointer: this is a bite out of a sand pile.
+        this.erasing = true;
+        if (this.eraseAt(point) > 0) this.emitCount();
       }
       return;
     }
@@ -611,6 +795,11 @@ export class ToyBoxEngine {
     this.pointer = point;
     this.pointerInside = true;
 
+    if (this.erasing) {
+      if (this.eraseAt(point) > 0) this.emitCount();
+      return;
+    }
+
     const drag = this.drag;
     if (!drag) {
       this.updateCursor(point);
@@ -628,10 +817,15 @@ export class ToyBoxEngine {
         x: Math.min(Math.max(point.x + drag.offset.x, 0), this.size.w),
         y: Math.min(Math.max(point.y + drag.offset.y, 0), this.size.h),
       });
+      // Static bodies move by teleport, so the granular layer never sees a
+      // velocity to wake a sleeping pile with. Do it explicitly.
+      const { min, max } = drag.body.bounds;
+      this.grainWorld?.wakeIn(min.x - 8, min.y - 8, max.x + 8, max.y + 8);
     }
   };
 
   private onPointerUp = (): void => {
+    this.erasing = false;
     if (this.drag) this.endDrag();
   };
 

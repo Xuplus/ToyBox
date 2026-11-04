@@ -25,12 +25,15 @@ depends on that, it says so.
   every ball–ball contact is polygon SAT. This is *not* the bottleneck anyone
   usually blames (the per-step `bodies.sort` is 0.7%).
 - Solver is 29%, broadphase 9%, integration 2%, rendering ~2%.
-- A typed-array granular solver does the same for balls in **0.7–1.6 µs per
-  body**, 5–12× cheaper, and is in the tree as `src/physics/grains.ts`
-  (`?bench` only, prototype).
-- Even so: **10k is the edge, 40k is 60 ms/step.** No JS/WASM rigid-body engine
-  gets to tens of thousands at 60 Hz in a browser; that number only comes from a
-  particle layer with a batched GPU renderer — which is now what we have.
+- A typed-array granular solver does the same for piles of small round things in
+  **~0.2 µs per moving grain**, and it is now a first-class toy: sand and water
+  pour from hoppers, bury crates, ride belts, and **sleep when they settle**, so
+  8,000 settled grains cost 0.17 ms - less than 8,000 moving ones cost per
+  frame of a 60 Hz budget by a factor of ten.
+- The wall for grains is *packing density*, not body count: past ~60% of the
+  box the contact graph is over-constrained, the pile never settles, and the
+  step time goes up an order of magnitude. The wall for rigid bodies is matter's
+  9 µs/body. Neither is the renderer, which is the point.
 
 ---
 
@@ -164,37 +167,70 @@ wants a unit test against the SAT result rather than a quick patch at midnight.
 
 ---
 
-## 6. The granular prototype (how to actually get to tens of thousands)
+## 6. The granular layer (shipped): sand and water
 
 `src/physics/grains.ts` is a second, much smaller engine for the case that
 dominates: thousands of *circles*. Positions and velocities live in
 `Float32Array`s, a counting-sort uniform grid does broadphase in O(n), and 3
-Gauss–Seidel relaxation passes resolve contacts. No objects per body, no
+Gauss-Seidel relaxation passes resolve contacts. No objects per body, no
 allocation per step, no rotation.
 
-Rotation is the thing it gives up — and the renderer never draws ball rotation
+Rotation is the thing it gives up - and the renderer never draws ball rotation
 anyway (`drawBall` uses a fixed gradient), so **for balls the result is visually
 identical**.
 
-2.5× playfield (3540×1680), r = 5 grains:
+It is now a toy, not a prototype: two materials (`MATERIALS` in the same file
+describes the colour, friction, restitution, cohesion and sleep behaviour of
+each), grains collide with every Matter body and leave a load behind (so sand
+weighs a crate down and tips it if it is off centre), a conveyor's surface drift
+carries whatever rests on it, and a settled pile **sleeps**.
 
-| grains | step ms | µs/body | draw ms | total @60 Hz |
-|---:|---:|---:|---:|---:|
-| 5 000 | 3.6 | 0.71 | 7.2 | ~11 ms ✅ |
-| 10 000 | 12.5 | 1.25 | 13.8 | ~26 ms ❌ |
-| 20 000 | 29.6 | 1.48 | 31.1 | ~61 ms ❌ |
-| 40 000 | 63.6 | 1.59 | 63.4 | ~127 ms ❌ |
+### The number that matters is *moving* grains, not grains
 
-Compare with Matter at 1.25 µs/body… it doesn't: Matter is 8.5–17 µs/body in the
-same box. **The granular layer is 5–12× cheaper per body**, and it is the only
-thing in this repo that renders 15,000 bodies at all (see the screenshot in
-`.shots/grains.png`).
+Measured in the app (`?bench`, `box.grains(n)`), box 1416×606, `est-60hz`:
 
-Where it still fails: **the draw**. 1.4 µs per `drawImage` in a CPU-rastered
-canvas is 14 ms for 10k — as expensive as the physics. That is a headless
-artifact in part (a GPU-composited canvas is much cheaper), but it is also the
-warning: at these counts **the renderer becomes the bottleneck again**, and the
-answer there is one instanced draw call, not 10,000 `drawImage`s.
+| grains | radius | state | step ms | µs/grain |
+|---:|---:|---|---:|---:|
+| 2 000 | 3 | all falling | 0.43 | 0.22 |
+| 4 000 | 3 | all falling | 0.94 | 0.24 |
+| 8 000 | 3 | all falling | 1.70 | 0.21 |
+| 4 000 | 3 | settled | **0.17** | 0.04 |
+| 8 000 | 3 | settled | **0.17** | 0.02 |
+| 7 000 | 5 | 64% packed (a full box) | 4.2 | 0.6 |
+
+Three things fall out of that table:
+
+1. **Asleep grains are nearly free.** 8,000 settled grains cost the same as
+   4,000: the sleep window is the only work left, and it is a subtraction.
+2. **An awake grain is ~0.2 µs**, so 8,000 of them moving at once is 1.7 ms of a
+   16.7 ms budget. This is 6-8× cheaper per body than the 1.5 µs/body the first
+   prototype measured, because the contact loop no longer does velocity work it
+   cannot use.
+3. **The ceiling is the box, not the solver.** Pack the same box to 64% and the
+   solver can no longer converge: the pile never comes to rest, so nothing
+   sleeps, and step time goes up an order of magnitude. At 90% packing (16,000
+   grains of r=3) it collapses to 136 ms/step. That is a box *full of sand*, and
+   no amount of tuning fixes it - the contact graph is over-constrained.
+
+### What it costs in the toy
+
+A source pours 200 (sand) or 150 (water) grains a second. The stream is awake by
+definition, so the price of pouring is the stream: ~400 grains in flight is
+0.08 ms. What piles up goes to sleep behind it. The interesting measurement is
+therefore the one the toy actually produces - pour for a while and read
+`grains` against `grainsAwake` in `stats()`.
+
+### What it gives up, and why that is the right trade
+
+- **Rotation.** Sand shows no rotation anyway. Anything that *does* rotate
+  (crates, planks, ropes) stays on the rigid path.
+- **Stacking of shapes.** A grain pile is held up by contacts, not by a solver
+  that understands torque, so a stack of grains is a heap and not a tower. That
+  is exactly what sand does.
+- **Water is not a fluid.** Cohesion plus low friction plus translucency reads as
+  a liquid at this scale; it does not level like a real one, it does not have a
+  pressure field, and it does not float things. A real SPH/PBF solver is a
+  different project.
 
 ---
 
@@ -331,9 +367,9 @@ L ≈ a week+.
 | # | change | cost | win | status |
 |---|---|---|---|---|
 | 1 | **WebGL2 instanced renderer** | M | draws 58× at 20k; makes any body count possible | **shipped** (§7) |
-| 2 | **Granular layer as a real toy** (sand/dust/water, cohesion) | M | 5–12× per body for circles | prototype |
+| 2 | **Granular layer as a real toy** (sand + water, cohesion, rigid-body coupling, sleep) | M | 0.2 µs per *moving* grain, free once settled | **shipped** (§6) |
 | 3 | Matter circle fast path in `Collision.collides` | S | 1.8–2.5× on the rigid step | todo |
-| 4 | `enableSleeping` for settled scenes + islands | S | large when the box is idle | not wired |
+| 4 | `enableSleeping` for settled scenes + islands | S | large when the box is idle | not wired; the granular layer sleeps already |
 | 5 | Ropes/chains/explosives on Matter constraints + impulses | S | none — pure capability | todo |
 | 6 | Worker + `SharedArrayBuffer` + interpolation | M | +16.7 ms budget, no jank | todo |
 | 7 | Own SoA rigid solver (convex polys + circles + joints) | L | 3–5× over matter on rigid | not started |
@@ -343,12 +379,15 @@ Notes:
 
 - **(1) is done.** The painter now costs 0.06–0.5 ms whatever is in the box, so
   the frame budget is entirely physics. Everything below is about the solver.
-- **(2) is what the user actually asked for** — a body that is *not* a rigid
-  body: thousands of grains that look like sand or water. The prototype already
-  does 10k in 12.5 ms; cohesion (a small attractive term between neighbours) and
-  two relaxation passes instead of three are the remaining tuning. The renderer
-  no longer stands in its way: 7,747 grains cost 0.07 ms to draw.
+- **(2) is done.** Sand and water are in the palette, pour from hoppers, bury
+  crates, run down ramps, ride belts, and go to sleep when they settle. The
+  measured limit is now the *box*, not the solver: fill it past about 60%
+  packing and a grain pile can no longer converge, which is a property of the
+  material rather than of the code.
 - **(3)** is ~80 lines and a test. Do it when the rigid path matters again.
+- **(4)** now matters less: rigid toys are counted in dozens, and the granular
+  layer has its own sleep. It becomes interesting when a big stack of planks
+  sits still.
 - **(6)** buys no speed, it buys a frame of headroom. Requires cross-origin
   isolation headers on the Caddy side ([MDN SAB](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/SharedArrayBuffer)).
 - **(7)** is only worth it if rigid *polygons* ever need to go past a couple of
@@ -367,19 +406,23 @@ The measured budget at 60 Hz is 16.7 ms:
 | workload | physics | draw (instanced) | total |
 |---|---:|---:|---:|
 | 1 000 matter balls | 4.1 ms | 0.3 ms | 4.4 ms |
-| 1 500 matter balls | 4.9 ms | 0.5 ms | 5.4 ms |
-| 10 000 matter boxes | 13.8 ms | 0.4 ms | 14.2 ms ✅ |
-| 10 000 grains | 12.5 ms | 0.1 ms | 12.6 ms ✅ |
-| 20 000 grains | 29.6 ms | 0.1 ms | 29.7 ms ✗ |
-| 20 000 matter circles | 176 ms | 0.5 ms | 176 ms ✗ |
+| 8 000 grains, all moving | 1.7 ms | 0.1 ms | 1.8 ms |
+| 8 000 grains, settled | 0.2 ms | 0.1 ms | 0.3 ms |
+| 10 000 matter boxes | 13.8 ms | 0.4 ms | 14.2 ms |
+| 7 000 grains at 64% packing | 4.2 ms | 0.1 ms | 4.3 ms |
+| 16 000 grains at 90% packing | 136 ms | 0.3 ms | 136 ms |
+| 20 000 matter circles | 176 ms | 0.5 ms | 176 ms |
 
-So the honest ceiling right now is **~10,000 dynamic bodies at 60 Hz** — as
-grains or as settled boxes — and the two things standing between that and 20k
-are solver cost, not rendering and not the engine brand:
+So the honest picture is:
 
-- fewer relaxation passes / fewer solver iterations (quality trade)
-- skipping bodies that are at rest (islands, sleeping)
-- a worker so a 20 ms step can run at 50 Hz while the screen stays at 60
+- **Granular bodies**: 8,000 moving at once, or the whole box settled, is
+  comfortably inside the frame. That is roughly 10× the rigid ceiling, and it
+  buys the thing the toy wants - sand you can pour, water you can spill, balls
+  you can fill the box with.
+- **Rigid bodies**: ~2,000 at 60 Hz, because matter is 9 µs per polygon body.
+- **The wall for grains is packing density, not body count.** Past about 60%
+  of the box, contacts are over-constrained, the pile never settles, and the
+  cost goes up by an order of magnitude. It is a full box of sand at that point.
 
 And for the toy box specifically, the split that makes sense is the one the
 numbers describe:
@@ -387,14 +430,14 @@ numbers describe:
 1. **Rigid layer** (matter today): boxes, ramps, belts, ropes, note blocks,
    explosives. Hundreds to a couple of thousand. It rotates, stacks and
    shatters properly, and it is not the bottleneck.
-2. **Granular layer** (own solver): balls, sand, water, shards. Tens of
-   thousands. No rotation — which the renderer never showed anyway — with
-   cohesion, jetting and drag on top for liquids.
+2. **Granular layer** (own solver): sand, water, and anything else that is
+   really a pile of small round things. No rotation - which the renderer never
+   showed anyway - with cohesion and drag on top for liquids.
 3. **One renderer** for both: instanced circles, batched polygons, 0.1 ms at 20k
-   — shipped, and no longer the reason anything is capped.
+   - shipped, and no longer the reason anything is capped.
 
 That combination is what "the same quality but much faster" looks like here, and
-every step of it is now measured rather than assumed. The next thing to build is
-**(2)**: the granular layer as a real toy, since it is the only way past ~2,000
-bodies and it already has a solver and a free renderer waiting for it.
+every step of it is now measured rather than assumed. What is left is capability
+rather than speed: ropes, explosives, and a worker to buy a whole extra frame of
+headroom.
 

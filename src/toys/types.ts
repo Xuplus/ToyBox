@@ -1,4 +1,5 @@
 import type Matter from 'matter-js';
+import type { GrainMaterial } from '../physics/grains';
 
 export type ToyId =
   | 'ballBouncy'
@@ -13,11 +14,13 @@ export type ToyId =
   | 'beltRight'
   | 'beltLeft'
   | 'noteBlock'
-  | 'ballSpawner';
+  | 'ballSpawner'
+  | 'sandSource'
+  | 'waterSource';
 
-export type ToyKind = 'ball' | 'block' | 'belt' | 'note' | 'spawner';
+export type ToyKind = 'ball' | 'block' | 'belt' | 'note' | 'spawner' | 'source';
 
-/** A toy that releases balls on its own — the stress-test workhorse. */
+/** A toy that releases balls on its own - the stress-test workhorse. */
 export interface SpawnerSpec {
   /** milliseconds between balls */
   rateMs: number;
@@ -29,6 +32,22 @@ export interface SpawnerSpec {
   spread: number;
   /** time owed since the last emission. Mutated by the engine. */
   acc: number;
+}
+
+/** A toy that pours a granular material - sand or water - into the box. */
+export interface SourceSpec {
+  /** which material, see `GRAIN` in `physics/grains.ts` */
+  material: GrainMaterial;
+  /** grains per second */
+  perSecond: number;
+  /** downward speed given to a fresh grain, px per step */
+  speed: number;
+  /** half-width of the mouth stream, world px */
+  spread: number;
+  /** grains owed since the last emission; fractional. Mutated by the engine. */
+  acc: number;
+  /** grains already poured, for the readout */
+  poured: number;
 }
 
 /** Everything the renderer, the conveyor pass and the break logic need to know
@@ -53,6 +72,8 @@ export interface ToyMeta {
   belt?: { dir: 1 | -1; speed: number };
   /** ball spawner behaviour */
   spawner?: SpawnerSpec;
+  /** granular source behaviour */
+  source?: SourceSpec;
   /** impact speed (px/step) above which this body shatters */
   breaksAt?: number;
   /** true for a piece produced by shattering */

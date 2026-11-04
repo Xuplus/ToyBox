@@ -1,4 +1,5 @@
 import type { PerfStats, Tool, ToyBoxEngine, Tuning } from './engine/ToyBoxEngine';
+import type { GrainMaterial } from './physics/grains';
 import type { ToyId } from './toys/types';
 
 /** Small surface for automated measurement. See `installBenchHook`. */
@@ -15,11 +16,11 @@ export interface BenchApi {
   reset(): void;
   /** playfield multiplier, same values as the size control */
   scale(n: number): void;
-  /** quality/throughput knobs — sleeping, solver iterations, sprite renderer */
+  /** quality/throughput knobs - sleeping, solver iterations, sprite renderer */
   tune(options: Tuning): Tuning;
-  /** replace the box with `n` grains (the granular prototype) */
-  grains(n: number, radius?: number): number;
-  /** select a tool, as the palette would — for reproducible screenshots */
+  /** replace the box with `n` grains of one material */
+  grains(n: number, radius?: number, kind?: GrainMaterial): number;
+  /** select a tool, as the palette would - for reproducible screenshots */
   tool(id: Tool): void;
 }
 
@@ -59,7 +60,8 @@ export function installBenchHook(engine: ToyBoxEngine): void {
     reset: () => engine.resetStats(),
     scale: (n: number) => engine.setScale(n),
     tune: (options: Tuning) => engine.tune(options),
-    grains: (n: number, radius?: number) => engine.spawnGrains(n, radius),
+    grains: (n: number, radius?: number, kind?: GrainMaterial) =>
+      engine.spawnGrains(n, radius, kind),
     tool: (id: Tool) => engine.setTool(id),
   };
 }

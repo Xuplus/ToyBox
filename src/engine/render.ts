@@ -1,21 +1,21 @@
 import type Matter from 'matter-js';
 import { alpha, shade } from '../lib/color';
-import type { GrainWorld } from '../physics/grains';
+import { MATERIALS, type GrainWorld } from '../physics/grains';
 import { metaOf } from '../toys/meta';
 import type { ToyMeta } from '../toys/types';
 import type { Ghost, Painter, Scene } from './scene';
 import { ballSprite, resetSprites } from './sprites';
 
-/** Sand-coloured grains, so the granular layer reads as its own material. */
-const GRAIN_COLOR = '#e0a458';
+/** The hopper housing, shared with the WebGL painter. */
+const SOURCE_HOUSING = '#333b4c';
 
 /**
- * The canvas 2D painter — the fallback when WebGL2 is unavailable, and the
+ * The canvas 2D painter - the fallback when WebGL2 is unavailable, and the
  * reference the instanced path is checked against.
  *
  * It draws one body at a time with real path operations and gradients, which is
  * fine for a few hundred toys and is what set the ceiling at ~1,350 bodies
- * before the WebGL path existed. See `PERFORMANCE.md §7`.
+ * before the WebGL path existed. See `PERFORMANCE.md` section 7.
  */
 export class Canvas2DPainter implements Painter {
   readonly kind = 'canvas2d';
@@ -80,22 +80,30 @@ export function renderScene(ctx: CanvasRenderingContext2D, input: Scene, grid: P
 }
 
 /**
- * The granular layer: one cached sprite, blitted `count` times. No path work,
- * no gradients, no per-body state on the render side — that is the whole reason
- * tens of thousands of grains are possible.
+ * The granular layer: one cached sprite per material, blitted `count` times. No
+ * path work, no gradients, no per-body state on the render side - that is the
+ * whole reason tens of thousands of grains are possible.
  */
 function drawGrains(
   ctx: CanvasRenderingContext2D,
   world: GrainWorld,
   pixelRatio: number,
 ): void {
-  const { x, y, count } = world;
+  const { x, y, count, kind } = world;
   if (count === 0) return;
 
-  const sprite = ballSprite(GRAIN_COLOR, world.options.radius, pixelRatio);
-  const half = sprite.extent / 2;
+  const sprites = MATERIALS.map((material) =>
+    ballSprite(material.color, world.options.radius, pixelRatio, {
+      rim: material.border > 0,
+      alpha: material.alpha,
+    }),
+  );
+  const halves = sprites.map((sprite) => sprite.extent / 2);
 
   for (let i = 0; i < count; i++) {
+    const m = kind[i];
+    const sprite = sprites[m];
+    const half = halves[m];
     ctx.drawImage(sprite.canvas, x[i] - half, y[i] - half, sprite.extent, sprite.extent);
   }
 }
@@ -103,7 +111,7 @@ function drawGrains(
 /**
  * The fast path: circles are blitted from a cache, one drawImage each, with no
  * save/restore and no allocation. Everything else (blocks, belts, note bars,
- * shards, the body being dragged — which needs its glow) falls back to the
+ * shards, the body being dragged - which needs its glow) falls back to the
  * vector renderer.
  */
 function drawSprites(
@@ -250,6 +258,10 @@ function drawBody(
       ctx.rotate(body.angle);
       drawSpawner(ctx, meta, time);
       break;
+    case 'source':
+      ctx.rotate(body.angle);
+      drawSource(ctx, meta, time);
+      break;
     default:
       // Polygons are drawn from their world vertices, so no extra rotation.
       if (meta.shape !== 'poly') ctx.rotate(body.angle);
@@ -335,7 +347,7 @@ function drawBlock(ctx: CanvasRenderingContext2D, body: Matter.Body, meta: ToyMe
 
   // Shards are many and short-lived: a flat fill keeps a big break cheap.
   // (This used to guess from the size, which quietly swallowed the plank and
-  // its grain line — the metadata knows, so ask it.)
+  // its grain line - the metadata knows, so ask it.)
   if (meta.shard) {
     ctx.fillStyle = shade(meta.color, -0.08);
     roundedRect(ctx, -w / 2, -h / 2, w, h, Math.min(3, radius));
@@ -520,6 +532,47 @@ function drawSpawner(ctx: CanvasRenderingContext2D, meta: ToyMeta, time: number)
     ctx.arc(side * (w / 2 - 8), -h / 2 + 8, 2.4, 0, Math.PI * 2);
     ctx.fill();
   }
+}
+
+function drawSource(ctx: CanvasRenderingContext2D, meta: ToyMeta, time: number): void {
+  const { w, h } = meta;
+  const radius = 9;
+
+  const fill = ctx.createLinearGradient(0, -h / 2, 0, h / 2);
+  fill.addColorStop(0, shade(SOURCE_HOUSING, 0.26));
+  fill.addColorStop(1, shade(SOURCE_HOUSING, -0.4));
+
+  roundedRect(ctx, -w / 2, -h / 2, w, h, radius);
+  ctx.fillStyle = fill;
+  ctx.fill();
+
+  ctx.strokeStyle = shade(SOURCE_HOUSING, -0.6);
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+
+  ctx.strokeStyle = alpha(meta.accent, 0.5);
+  ctx.lineWidth = 1;
+  roundedRect(ctx, -w / 2 + 3, -h / 2 + 3, w - 6, h - 6, Math.max(1, radius - 2));
+  ctx.stroke();
+
+  // The mouth, in the material's own colour: sand and water differ at a glance.
+  ctx.fillStyle = alpha(meta.accent, 0.92);
+  roundedRect(ctx, -w * 0.34, h / 2 - 10, w * 0.68, 10, 5);
+  ctx.fill();
+
+  // Stream. Its own clock, not the pour rate - 340 grains a second is far too
+  // fast to animate at the real interval.
+  const period = 380;
+  const phase = (((time % period) + period) % period) / period;
+  ctx.fillStyle = meta.accent;
+  for (let i = 0; i < 4; i++) {
+    const t = (phase + i / 4) % 1;
+    ctx.globalAlpha = 0.85 * (1 - t * 0.6);
+    ctx.beginPath();
+    ctx.arc(0, h / 2 + t * h * 1.15, 3.4 - t * 1.7, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
 }
 
 function drawNote(ctx: CanvasRenderingContext2D, meta: ToyMeta, time: number): void {

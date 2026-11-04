@@ -3,7 +3,7 @@
 // Drawing a ball from scratch is a handful of path operations and two freshly
 // allocated radial gradients; at a thousand balls that is a measurable slice of
 // every frame. A ball never changes shape, so it can be rendered once per
-// (colour, radius, device scale) and blitted with a single drawImage — which is
+// (colour, radius, device scale) and blitted with a single drawImage - which is
 // also what makes a canvas of thousands of bodies possible at all.
 
 import { shade } from '../lib/color';
@@ -17,8 +17,15 @@ const PAD = 2;
 
 export interface BallSprite {
   canvas: Sprite;
-  /** width in world px — draw it with `drawImage(canvas, -extent/2, -extent/2, extent, extent)` */
+  /** width in world px - draw it with `drawImage(canvas, -extent/2, -extent/2, extent, extent)` */
   extent: number;
+}
+
+export interface SpriteStyle {
+  /** draw the dark rim; false lets neighbouring grains merge into one mass */
+  rim?: boolean;
+  /** fill opacity - the granular layer's water is translucent */
+  alpha?: number;
 }
 
 /**
@@ -27,9 +34,16 @@ export interface BallSprite {
  * The canvas is sized so that drawing it back at `extent` world px maps it
  * one-to-one onto device pixels: no resampling, no blur.
  */
-export function ballSprite(color: string, radius: number, k: number): BallSprite {
+export function ballSprite(
+  color: string,
+  radius: number,
+  k: number,
+  style: SpriteStyle = {},
+): BallSprite {
+  const rim = style.rim !== false;
+  const opacity = style.alpha ?? 1;
   const extent = radius * 2 + PAD;
-  const key = `${color}|${radius}|${k}`;
+  const key = `${color}|${radius}|${k}|${rim ? 1 : 0}|${opacity}`;
   const hit = cache.get(key);
   if (hit) return hit;
 
@@ -42,6 +56,7 @@ export function ballSprite(color: string, radius: number, k: number): BallSprite
   if (!g) return { canvas, extent };
 
   g.setTransform(k, 0, 0, k, 0, 0);
+  g.globalAlpha = opacity;
 
   const c = extent / 2;
   const r = radius;
@@ -56,9 +71,11 @@ export function ballSprite(color: string, radius: number, k: number): BallSprite
   g.fillStyle = fill;
   g.fill();
 
-  g.lineWidth = 1.5;
-  g.strokeStyle = shade(color, -0.55);
-  g.stroke();
+  if (rim) {
+    g.lineWidth = 1.5;
+    g.strokeStyle = shade(color, -0.55);
+    g.stroke();
+  }
 
   // Specular highlight, top-left: balls don't rotate their shading.
   const spec = g.createRadialGradient(c - r * 0.34, c - r * 0.4, 0, c - r * 0.34, c - r * 0.4, r * 0.6);
@@ -74,7 +91,7 @@ export function ballSprite(color: string, radius: number, k: number): BallSprite
   return sprite;
 }
 
-/** Drop everything — device scale and playfield zoom are part of the key. */
+/** Drop everything - device scale and playfield zoom are part of the key. */
 export function resetSprites(): void {
   cache.clear();
 }

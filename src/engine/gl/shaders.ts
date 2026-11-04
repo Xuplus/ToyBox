@@ -84,6 +84,7 @@ in vec4 aColor;
 in float aGlow;
 in vec4 aBorder;
 in float aDash;
+in float aBorderScale;
 
 uniform vec2 uWorld;
 
@@ -93,6 +94,7 @@ flat out vec4 vColor;
 flat out vec4 vBorder;
 flat out float vDash;
 flat out float vGlow;
+flat out float vBorderScale;
 
 void main() {
   float pad = 3.0 + aGlow * 55.0;
@@ -107,6 +109,7 @@ void main() {
   vBorder = aBorder;
   vDash = aDash;
   vGlow = aGlow;
+  vBorderScale = aBorderScale;
 }`;
 
 export const CIRCLE_FS = `#version 300 es
@@ -118,6 +121,7 @@ flat in vec4 vColor;
 flat in vec4 vBorder;
 flat in float vDash;
 flat in float vGlow;
+flat in float vBorderScale;
 out vec4 outColor;
 
 void main() {
@@ -139,8 +143,8 @@ void main() {
   fill = mix(fill, vec3(1.0), 0.6 * (1.0 - st));
 
   float outline = 0.0;
-  if (vBorder.a > 0.0) {
-    outline = clamp((0.75 + aa - abs(sdf)) / (2.0 * aa), 0.0, 1.0) * vBorder.a;
+  if (vBorder.a > 0.0 && vBorderScale > 0.0) {
+    outline = clamp((0.75 + aa - abs(sdf)) / (2.0 * aa), 0.0, 1.0) * vBorder.a * vBorderScale;
     if (vDash > 0.0) {
       float arc = dist * atan(vLocal.y, vLocal.x);
       outline *= step(0.55 * vDash, mod(arc, vDash));

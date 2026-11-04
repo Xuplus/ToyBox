@@ -1,6 +1,7 @@
 import Matter from 'matter-js';
 import { noteForIndex, noteName } from '../audio/notes';
 import { shade } from '../lib/color';
+import { GRAIN, MATERIALS, type GrainMaterial } from '../physics/grains';
 import { setMeta } from './meta';
 import type { SpawnContext, ToyDef, ToyId } from './types';
 
@@ -132,7 +133,7 @@ const RAMP_W = 150;
 const RAMP_H = 72;
 
 /**
- * A static wedge — the one non-rectangular block. Static so it stays where it is
+ * A static wedge - the one non-rectangular block. Static so it stays where it is
  * put and works as a ramp immediately (belts and note blocks are static too).
  */
 function makeRamp(): ToyDef {
@@ -224,9 +225,58 @@ function makeSpawner(): ToyDef {
   };
 }
 
+const SOURCE_W = 84;
+const SOURCE_H = 46;
+
+/**
+ * A hopper that pours a granular material. Static like the ball spout, and for
+ * the same reason: it should stay where it is put, usually up near the ceiling.
+ *
+ * The palette colour *is* the material colour - that is what tells sand from
+ * water at a glance - so the housing is drawn in a fixed dark slate by the
+ * painters and only the mouth and the falling stream take the accent.
+ */
+function makeSource(
+  id: ToyId,
+  material: GrainMaterial,
+  nameKey: string,
+  perSecond: number,
+): ToyDef {
+  const color = MATERIALS[material].color;
+
+  return {
+    id,
+    kind: 'source',
+    nameKey,
+    color,
+    accent: shade(color, 0.4),
+    swatch: 'spawner',
+    w: SOURCE_W,
+    h: SOURCE_H,
+    build(x, y) {
+      const body = Matter.Bodies.rectangle(x, y, SOURCE_W, SOURCE_H, {
+        label: id,
+        isStatic: true,
+        friction: 0.4,
+        frictionStatic: 0.6,
+        restitution: 0.1,
+      });
+
+      return setMeta(body, {
+        toyId: id,
+        kind: 'source',
+        color,
+        accent: shade(color, 0.4),
+        w: SOURCE_W,
+        h: SOURCE_H,
+        source: { material, perSecond, speed: 1.5, spread: 26, acc: 0, poured: 0 },
+      });
+    },
+  };
+}
+
 const NOTE_W = 84;
 export const NOTE_H = 28;
-
 /** One colour per scale degree, so the bars read as a little xylophone. */
 const NOTE_COLORS = [
   '#5b8cff',
@@ -293,6 +343,9 @@ export const TOYS: ToyDef[] = [
 
   makeSpawner(),
 
+  makeSource('sandSource', GRAIN.sand, 'toy_sandSource', 200),
+  makeSource('waterSource', GRAIN.water, 'toy_waterSource', 150),
+
   noteBlock,
 ];
 
@@ -306,6 +359,7 @@ export function toyById(id: string): ToyDef | undefined {
 export const PALETTE_GROUPS: { titleKey: string; ids: ToyId[] }[] = [
   { titleKey: 'group_balls', ids: ['ballBouncy', 'ballMarble', 'ballHeavy', 'ballBeach'] },
   { titleKey: 'group_blocks', ids: ['crate', 'plank', 'ramp', 'glass', 'brick'] },
+  { titleKey: 'group_fluids', ids: ['sandSource', 'waterSource'] },
   { titleKey: 'group_belts', ids: ['beltRight', 'beltLeft'] },
   { titleKey: 'group_spawners', ids: ['ballSpawner'] },
   { titleKey: 'group_music', ids: ['noteBlock'] },
