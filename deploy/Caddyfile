@@ -1,0 +1,17 @@
+# ToyBox — STATIC app on elnuevos.es, served under /toybox.
+# No Node process, no port, no pm2: Caddy serves the built files directly
+# (same model as the root ElNuevos dashboard and /jigsawpuzzle).
+#
+# This block belongs in the server's main /etc/caddy/Caddyfile, inside the
+# elnuevos.es site — i.e. copied into ElNuevos/deploy/Caddyfile next to the
+# other `handle` blocks. Built assets are published to /var/www/toybox by
+# deploy/setup.sh. Reload Caddy after adding it: `sudo systemctl reload caddy`.
+
+# handle_path strips the /toybox prefix so the URL maps onto the files, which
+# live directly in the webroot (e.g. /toybox/assets/x.js ->
+# /var/www/toybox/assets/x.js). try_files gives the SPA fallback.
+handle_path /toybox* {
+    root * /var/www/toybox
+    try_files {path} /index.html
+    file_server
+}

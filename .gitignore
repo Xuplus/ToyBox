@@ -1,0 +1,11 @@
+node_modules
+dist
+dist-ssr
+*.local
+.DS_Store
+.vite
+# Not committed: a platform-locked lockfile breaks cross-OS installs (npm/cli#4828).
+package-lock.json
+*.tsbuildinfo
+vite.config.ts.timestamp-*
+.npm-cache

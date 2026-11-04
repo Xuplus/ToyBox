@@ -1,0 +1,215 @@
+# PLAN.md — ToyBox
+
+Design for a browser-based **2D physics sandbox**: a box you fill with toys and
+knock about. Balls with different weight and bounciness, blocks (some shatter on
+impact), conveyor belts, and musical blocks that ring a note when something hits
+them. You drag anything with the pointer and can throw it.
+
+Reference points: **Desktop Destroyer** (throwing things at breakable stuff),
+**The Incredible Machine** (a shelf of contraption parts), **SoupToys** (a
+sandbox of toys with no goal at all). The point is play, not score: there is no
+win state, no timer, no persistence.
+
+---
+
+## 0. Architecture — DECIDED: pure static, no backend
+
+The sandbox is single-player and client-only: every body, collision and sound is
+computed in the browser. There is no game state for a server to own and nothing
+to store. So the app follows the same model as `JigsawPuzzle` and the ElNuevos
+dashboard: **Vite + React + TypeScript, built to a static bundle, served by
+Caddy** under `handle_path /toybox*` from `/var/www/toybox`.
+
+- No Node process, no port, no pm2, no Socket.IO.
+- `BASE_PATH` is baked in at build time; app code never hard-codes `/toybox`.
+- Deploy is sudo-free so the existing push webhook can run it unattended.
+
+---
+
+## 1. Player experience
+
+1. The box opens with a small starter scene (a belt, a note block, a crate and
+   three balls) so it is never a cold empty page.
+2. Pick a toy from the palette → a translucent ghost follows the pointer →
+   click to drop it in.
+3. Drag any body to move it; release while moving to throw it. Dragging works on
+   static toys too (belts, note blocks), which is how you build a contraption.
+4. Things do the rest: balls bounce and roll, belts carry, glass and brick
+   shatter on a hard enough hit, note blocks ring.
+5. `Clear` empties the box; `Pause` freezes the simulation; the speaker toggles
+   audio; `EN/ES` toggles language.
+
+There is deliberately no scoring, no timer and no save.
+
+---
+
+## 2. Vocabulary
+
+- **Toy** — an entry in the palette (`ToyDef`) that can be spawned.
+- **Body** — the live Matter.js rigid body a toy produced (1:1 today; a toy may
+  return several bodies).
+- **Shard / fragment** — a body produced by shattering another. Not counted as a
+  toy, never shatters again.
+- **Belt** — a static body that imparts horizontal velocity to what rests on it.
+- **Strike** — a collision hard enough for a note block to sound.
+
+---
+
+## 3. The toy model
+
+Every toy is data plus a factory:
+
+```ts
+interface ToyDef {
+  id: ToyId;
+  kind: 'ball' | 'block' | 'belt' | 'note';
+  nameKey: string;       // i18n key
+  color; accent; swatch; // palette presentation
+  w; h;                  // footprint, also the ghost preview size
+  build(x, y, ctx): Body | Body[];
+}
+```
+
+`build` creates the Matter body and attaches a `ToyMeta` (via a `WeakMap`, not
+Matter's `plugin` bag) carrying colour, footprint, optional belt speed, break
+threshold, and pitch. Rendering, carrying and breaking all read that metadata —
+so a new toy usually needs **no code outside `catalog.ts`** (plus its name).
+
+The starting shelf:
+
+| Family | Toys |
+| --- | --- |
+| Balls | bouncy (r14, e .90), marble (r9, dense), cannonball (r26, e .25), beach ball (r34, light) |
+| Blocks | crate (56²), plank (176×18), ramp (150×72 static wedge), glass (58×76, breaks), brick (86×38, breaks) |
+| Belts | right / left, 200×22, 4.2 px/step |
+| Music | note block, 84×28, static, pitch cycles a C major pentatonic |
+
+---
+
+## 4. Physics — DECIDED: Matter.js
+
+Two options were on the table: hand-roll an impulse solver, or take a dependency.
+
+- A hand-rolled engine is the "no dependencies" move, but stable stacking,
+  friction, resting contacts and collision events are exactly the parts that
+  take weeks to stop jittering. A sandbox is judged on how *right* the stack of
+  crates feels.
+- **Matter.js** (MIT, 0.20) is a 2D rigid-body engine with circles, polygons,
+  compound bodies, sleeping, friction and — crucially — `collisionStart` events,
+  which is what makes note blocks and shattering a few lines instead of a
+  contact manifold implementation.
+
+**Decision: Matter.js at runtime.** It costs ~80 KB gzipped in the bundle, which
+is fine for a static toy. It is bundled, so there is no CDN dependency at play
+time.
+
+### Tuning that matters
+
+- **Fixed 60 Hz step.** `Engine.update(engine, STEP_MS)` from an accumulator,
+  never the raw frame delta: the same scene must behave the same on a 120 Hz
+  display.
+- **Walls sit outside the visible area.** The floor's top edge is exactly the
+  canvas bottom, so the canvas edge *is* the inside of the box and nothing is
+  drawn behind a wall.
+- **Velocity units are px per step.** Impact thresholds (glass 7, brick 11) and
+  the note threshold (1.2) are in those units; a typical fall reaches 10–20.
+- **Breaking is checked on `collisionStart`** with the relative velocity of the
+  two bodies. A body above its `breaksAt` is removed and replaced by a grid of
+  shards (`shardLayout`, pure) that inherit its velocity plus a small outward
+  impulse. Shards never break again and are not counted as toys.
+- **Belts emulate surface velocity.** Matter has no conveyor primitive, so each
+  step anything resting on a belt (within 12 px of the belt's top, horizontally
+  overlapping, not bouncing upward) has its horizontal velocity blended toward
+  the belt speed; circles also get a matching spin so balls roll rather than
+  slide. Debris rides belts too.
+- **Body cap.** `MAX_BODIES = 280`; the oldest dynamic body is evicted first, so
+  a shatter storm can't lock up a tab.
+
+---
+
+## 5. Rendering
+
+**Canvas 2D**, one canvas, drawn on every animation frame.
+
+This is the opposite call from `JigsawPuzzle` (which needed WebGL for ~40k
+pieces). Here the body count is in the low hundreds, the shapes are simple, and
+each body is a handful of gradient fills — 2D canvas handles it comfortably and
+keeps the code a fraction of the size. No asset pipeline: every visual is drawn
+from the toy's colour.
+
+Per-kind drawing lives in `engine/render.ts`: shaded spheres with a fixed
+specular (balls never rotate their shading), bevelled blocks with a per-toy
+detail (crate brace, brick joint, plank grain), translucent glass with a glint,
+belts with moving chevrons and end rollers, and note bars that glow for ~320 ms
+after being struck. Non-rectangular bodies (the ramp wedge) are drawn from their
+Matter vertices, so new polygon toys need no renderer work. Small bodies
+(shards) switch to a flat fill — a big break elsewhere spawns 9–16 of them at
+once.
+
+---
+
+## 6. Audio — procedural, no files
+
+A `WebAudio` synth (`audio/synth.ts`) generates everything:
+
+- **Note blocks**: a triangle fundamental plus a quiet octave, short exponential
+  decay, low-passed — a struck-bar timbre. Pitch comes from a C major pentatonic
+  scale over two octaves (`audio/notes.ts`), assigned in spawn order, so laying
+  down ten blocks gives you an instrument that cannot sound wrong.
+- **Breaking**: a decaying noise burst through a random band-pass, so every
+  crack is slightly different.
+
+The `AudioContext` is created lazily in `Synth.unlock()` on the first pointer
+down (browsers require a gesture) and never at module load. Muting ramps the
+master gain to zero rather than tearing down the graph.
+
+Per-block cooldown (70 ms) stops a resting ball from machine-gunning a note.
+
+---
+
+## 7. Repo layout (static app at the repo root)
+
+```
+src/
+  physics/   world.ts, conveyor.ts, shatter.ts   # Matter shell, pure where possible
+  toys/      catalog.ts, meta.ts, types.ts        # the registry — add toys here
+  engine/    ToyBoxEngine.ts, render.ts           # loop, input, canvas
+  audio/     notes.ts, synth.ts                   # scale + WebAudio synth
+  ui/        TopBar.tsx, Palette.tsx
+  lib/       color.ts
+  App.tsx, i18n.ts, styles.css, main.tsx
+deploy/
+  setup.sh   # build with BASE_PATH=/toybox, publish to /var/www/toybox
+  Caddyfile  # handle_path /toybox* { root + try_files + file_server }
+vite.config.ts  # base derived from BASE_PATH; dev on :5175
+PLAN.md / CLAUDE.md
+```
+
+`physics/`, `toys/` and `audio/notes.ts` stay DOM-free so `npm run test` can
+exercise them in plain Node. Canvas and pointer code lives only in `engine/`.
+
+---
+
+## 8. Status
+
+**Done.** Gravity, spawning with a ghost preview, constrained dragging and
+throwing, delete tool and right-click delete, four balls, five blocks (including
+a static wedge ramp), glass and brick shattering, two belts, pitched note blocks,
+pause, mute, clear, EN/ES, responsive layout, starter scene, body cap.
+
+**Open / next:**
+
+- Save and restore a scene in `localStorage` ("my contraption"), with an explicit
+  clear — the app currently stores nothing at all.
+- More toy families: funnels (concave, needs poly-decomp), dominoes, a fan, a
+  spring, a balloon (negative gravity) — each should fit the same `ToyDef`
+  contract.
+- A "shake" button (random impulse to everything) and a gravity slider.
+- Better touch affordances: currently a tap both selects and spawns; a
+  tap-to-place-then-drag model may read better on a phone.
+- Sound-block octave shift so the shelf can play a bass line and a melody.
+- Perf pass if the cap is ever raised: cache gradients per toy colour instead of
+  building them per body per frame.
+- **Ship it**: add the card to `ElNuevos/src/games.ts` (`status: 'soon'` first),
+  the `handle_path /toybox*` block to `ElNuevos/deploy/Caddyfile`, and the
+  `Xuplus/ToyBox` entry to `deploy/webhook/deploy.config.json`.
