@@ -870,7 +870,7 @@ export class ToyBoxEngine {
       // Static bodies move by teleport, so the granular layer never sees a
       // velocity to wake a sleeping pile with. Do it explicitly.
       const { min, max } = drag.body.bounds;
-      this.grainWorld?.wakeIn(min.x - 8, min.y - 8, max.x + 8, max.y + 8);
+      this.grainWorld?.wakeIn(min.x, min.y, max.x, max.y);
     }
   };
 

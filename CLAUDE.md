@@ -68,14 +68,18 @@ bundle served by Caddy**, and the `/toybox` prefix is baked into the build via
 - `src/lib/` — `frame-meter.ts` (rolling window of frame durations → fps, p95,
   mean) and `color.ts` (shade/alpha). Pure, no DOM.
 - `src/physics/grains.ts` — the **granular layer**: sand and water. Circles in
-  `Float32Array`s, counting-sort uniform grid, relaxation passes, no rotation, so
-  it is for piles rather than shapes. ~0.5 µs per *moving* grain against matter's
-  9, and a settled pile sleeps, so it is cheaper again once it stops.
+  `Float32Array`s, counting-sort uniform grid, no rotation, so it is for piles
+  rather than shapes. Two solvers share the grid: **sand** is contacts with
+  Coulomb friction (pairs found once per step into a list, then Gauss-Seidel
+  passes over it), **water** is Clavet double-density relaxation (Jacobi, two
+  iterations over a stored neighbour list). Well under matter's 9 µs per
+  *moving* grain, and still water and settled sand sleep.
   `MATERIALS` at the top of the file is the only description of what each
-  material is: colour, alpha, rim, friction, restitution, cohesion, rolling
+  material is: colour, alpha, rim, friction, restitution, mass, rolling
   resistance, whether it can hold a body up (`support`) and how hard it takes a
-  body's speed away (`grip`), whether it is drawn as a liquid, and how it sleeps.
-  Both painters read it, so a new material is one entry.
+  body's speed away (`grip`), whether it is a liquid, and how it sleeps
+  (`sleepWindows`, `sleepDrift`). `FLUID` holds the liquid solver's constants.
+  Both painters read `MATERIALS`, so a new material is one entry.
 - `src/engine/sprites.ts` — pre-rendered ball sprites, **canvas 2D path only**.
   Drawing a ball from gradients costs ~4× a blit; at a thousand balls that is a
   third of the frame. The WebGL path shades circles in a fragment shader and
@@ -151,8 +155,28 @@ Always run `npm run typecheck` and `npm run test` after changes.
   `Matter.Body` satisfies structurally. The solver must not import Matter.
 - **A grain's velocity is not a measure of rest.** A packed heap is never
   perfectly still, so sleep is decided on how far a grain moved over a window
-  (see `SLEEP_WINDOW`/`SLEEP_DRIFT` in `grains.ts`). Do not "simplify" that to a
+  (`SLEEP_WINDOW`, and `sleepDrift` per material). Do not "simplify" that to a
   velocity threshold: the heap will never sleep.
+- **Still is not enough to sleep: a grain must be held up.** `cradled()` is a
+  friction-cone test — a grain is held if "up" is inside the fan of pushes its
+  neighbours, the floor and the side walls give it. A grain perched on the
+  outside of one neighbour is still sliding and must not be frozen there; that
+  was the "floating sand" bug. Waking is the other half: a grain that moves a
+  radius marks its cell dirty, and the sleepers above it are woken on probation
+  (`wakeDirty`), with `audit()` re-checking a slice of sleepers every step as a
+  safety net. `wakeIn()` adds its own margin, so callers pass the bare bounds.
+- **Water holds nothing up, and sleeps a whole body at a time.** Sand is not
+  cradled by drops, so it sinks through a pool; only sand that has stopped,
+  jammed on drops, may sleep on them, and it is flagged `REST_WATER` so moving
+  water wakes it (dirt left by water alone wakes nothing else). A drop never
+  sleeps on its own: `settleLiquid()` floods the cells holding awake water into
+  connected bodies and sleeps a body once `POOL_STILL` of it is quiet. Per-drop
+  sleep never converged — a stopped drop is a wall its neighbours jostle.
+- **The liquid is Jacobi, two iterations.** Displacements are summed and applied
+  together. Pair-by-pair (Gauss-Seidel) in index order drives a steady current
+  along the bottom of a level pool, so it never sleeps; and a single relaxation
+  per step makes a pool ~20 drops deep boil for ever at the bottom. Both are
+  pinned by tests in `grains.test.ts`.
 - **A contact must kill the velocity it is holding.** `step()` accumulates the
   direction each grain was pushed (`supX`/`supY`) and removes that component of
   its velocity at the end of the step. Without it a supported grain keeps the
@@ -160,10 +184,11 @@ Always run `npm run typecheck` and `npm run test` after changes.
   sleep freeze a pile in a shape it was still falling out of, and makes waking
   one look like an explosion. Tangential motion must stay untouched, or sand
   stops flowing and water stops levelling.
-- **Perfect circles roll for ever.** `rolling` in `MATERIALS` is the only reason
-  a flat layer of grains ever stops: 0.9 for sand, and 1 (none) for water. It
-  applies only to contacted grains slower than `ROLL_SPEED`, so a falling stream
-  is unaffected.
+- **Perfect circles roll for ever.** `rolling` in `MATERIALS` is why a flat
+  layer of sand grains stops: 0.9 for sand, and 1 (none) for water. It applies
+  only to contacted grains slower than `ROLL_SPEED` and not riding a body, so a
+  falling stream and sand on a belt are unaffected. The angle of repose comes
+  from `friction` (Coulomb, 0.4 ≈ 32–38°), not from this.
 - **The coupling is a constraint, never a force.** `supportImpulse` and
   `dragImpulse` in `grains.ts` take speed *out of* a body along the contact
   normal and may carry its weight; they may never add speed. `holdFx/holdFy` is
@@ -177,10 +202,12 @@ Always run `npm run typecheck` and `npm run test` after changes.
   body one radius into a pile has as many contacts above it as below, so the net
   sum is zero and it sinks for ever. `holdF` keeps just the ones pushing it up.
   A real fix is a density constraint, not a bigger sum - see `PLAN.md §10`.
-- **A liquid is drawn, not simulated.** `liquid` in `MATERIALS` switches the dot
-  pipeline to a flat fill with a feathered edge and no specular (`aLiquid` in
-  `shaders.ts`), which is what makes a cluster read as one body of water. The
-  physics underneath is still circles; do not expect pressure or buoyancy.
+- **A liquid has pressure, but bodies do not feel it.** `liquid` in `MATERIALS`
+  switches the solver to double-density relaxation (so water runs and levels)
+  and the dot pipeline to a flat fill with a feathered edge and no specular
+  (`aLiquid` in `shaders.ts`), which is what makes a cluster read as one body of
+  water. The coupling to rigid bodies is still `dragImpulse`: there is no
+  buoyancy, so a beach ball sinks.
 - **Shared header UX.** Top bar in normal flow — home (`🏠`, `href="/"` → the
   `elnuevos.es` root) + `🧰` title on the left, controls and language on the
   right. Never absolutely positioned. Mirrors the sibling games.

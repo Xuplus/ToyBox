@@ -9,24 +9,28 @@
 // What it gives up: rotation, contact manifolds, stacking of *shapes*. That is
 // why it is a layer beside the rigid-body engine, not a replacement for it.
 //
-// Four things make it a toy rather than a benchmark:
+// Sand and water are two different solvers sharing one grid:
 //
-//  - **Two materials.** Sand is dry and friable; water is translucent, slippery
-//    and slightly cohesive, so a puddle holds a surface instead of spreading
-//    into a film of lone droplets. `MATERIALS` is the only place a material's
-//    look and behaviour is described, and both painters read it from here.
-//  - **Rigid bodies.** Grains are pushed out of every Matter body each step and
-//    push back with an accumulated load, so a pile can weigh a crate down and a
-//    conveyor belt can carry sand along by its surface velocity.
-//  - **Sleep.** A grain that has not gone anywhere for half a second is put to
-//    rest and skipped entirely. A settled dune costs nothing, so the cost of
-//    the layer is the number of *moving* grains - which is what lets a twelve
-//    thousand grain box sit inside the frame budget.
-//  - **Rest is measured on motion, not on velocity.** A packed heap is never
-//    perfectly still: the contact solver leaves each grain with a velocity that
-//    the next contact takes straight back, so it never moves while never being
-//    still either. Asking where a grain *is* rather than how fast it is going
-//    is the difference between a layer that sleeps and one that does not.
+//  - **Sand is a frictional solid.** Grains collide as discs, and every contact
+//    carries Coulomb friction: the tangential impulse may cancel the slip
+//    entirely, up to `friction` times the normal impulse. That is static
+//    friction, and it is the only reason a heap holds a slope. Without it a
+//    pile is a slow liquid that only *looks* like sand because sleep froze it.
+//  - **Water is a pressure solve** (Clavet et al. 2005, "double density
+//    relaxation"). Each drop measures how crowded its neighbourhood is and
+//    pushes its neighbours away in proportion; a "near" pressure keeps drops
+//    apart. Pressure is isotropic, so a column of water pushes sideways as hard
+//    as down, and a pile levels into a pool instead of standing as a cone.
+//    Velocity is derived from where the drop ended up, so there is no separate
+//    impulse model for liquids.
+//
+// Sleep is decided on support, not on a timer. A grain sleeps once it has
+// stopped moving *and* something holds it up - the floor, a body, or neighbours
+// below it that it cannot slide off. It wakes when something hits it, or when
+// the grain under it goes away: every grain that moves more than a radius, and
+// every grain that is erased, leaves a "dirty" cell behind it, and the sleepers
+// in and above a dirty cell are woken to look again. A slow audit re-checks the
+// sleepers in round robin, so nothing can be left hanging in the air.
 
 import { GRAVITY_ACCEL, GRAVITY_SCALE } from './world';
 
@@ -41,14 +45,20 @@ export interface GrainMaterialSpec {
   alpha: number;
   /** opacity of the dark rim; 0 merges the grains into one mass */
   border: number;
-  /** fraction of the tangential slip killed per contact */
+  /** Coulomb coefficient: the most tangential impulse a contact can apply, as a
+   *  fraction of its normal impulse. It sets the angle of repose, though not
+   *  as tan(angle): discs interlock, so 0.4 stands at ~32-38 degrees, which is
+   *  dry sand. For a liquid it is a plain drag on the slip against a rigid
+   *  body instead, since water has no static friction. */
   friction: number;
   /** 0 = dead stop, 1 = off a wall like a rubber ball */
   restitution: number;
-  /** px of pull across the contact gap per pass - surface tension */
-  cohesion: number;
-  /** true for a true liquid: flat translucent fill and a feathered edge, so a
-   *  cluster reads as one body of water instead of a heap of blue beads */
+  /** relative mass, for sharing a correction between two different grains -
+   *  water gives way to sand, not the other way round */
+  mass: number;
+  /** true for a liquid: solved by pressure instead of by contacts, and drawn as
+   *  a flat translucent fill with a feathered edge so a cluster reads as one
+   *  body of water instead of a heap of blue beads */
   liquid: boolean;
   /** 1 when the medium can hold a body up, 0 when it cannot. Sand stands under
    *  a ball; water does not, and without buoyancy a "support" from water would
@@ -66,6 +76,11 @@ export interface GrainMaterialSpec {
   /** quiet windows before a grain is put to sleep. Water needs more, because
    *  a puddle that has not finished levelling still has somewhere to go. */
   sleepWindows: number;
+  /** px a grain may wander over a window and still count as stopped. A pool
+   *  of water is never still: the pressure solve leaves every drop wandering
+   *  a little inside a pool that is already level, so water needs more slack
+   *  than sand or it never sleeps at all. */
+  sleepDrift: number;
 }
 
 /** Everything about sand and water that can be seen or felt, in id order. */
@@ -75,45 +90,95 @@ export const MATERIALS: readonly GrainMaterialSpec[] = [
     color: '#e0a458',
     alpha: 1,
     border: 1,
-    friction: 0.22,
+    friction: 0.4,
     restitution: 0.1,
-    cohesion: 0,
+    mass: 1,
     liquid: false,
     support: 1,
     grip: 0.05,
     rolling: 0.9,
     sleepWindows: 1,
+    sleepDrift: 3,
   },
   {
-    // Water: almost no friction and enough cohesion to hold a surface, so it
-    // runs, levels and spreads instead of standing in a heap.
+    // Water: pressure instead of contacts, so it runs and levels.
     color: '#3f9fe6',
     alpha: 0.62,
     border: 0,
     friction: 0.01,
     restitution: 0.02,
-    cohesion: 0.12,
+    // Light against sand: water seeping through a heap must not shove its
+    // grains about (at 0.6 the seepage alone kept a dammed heap awake for
+    // ever), and sand dropped into a pool should go to the bottom.
+    mass: 0.15,
     liquid: true,
     support: 0,
     grip: 0.012,
     rolling: 1,
     sleepWindows: 2,
+    sleepDrift: 6,
   },
 ];
+
+// Per-material constants flattened for the inner loops: a property lookup on a
+// spec object per contact is measurable at ten thousand grains.
+const MU = Float32Array.from(MATERIALS, (m) => m.friction);
+const BOUNCE = Float32Array.from(MATERIALS, (m) => m.restitution);
+const INV_MASS = Float32Array.from(MATERIALS, (m) => 1 / m.mass);
+const LIQUID = Uint8Array.from(MATERIALS, (m) => (m.liquid ? 1 : 0));
+const ROLLING = Float32Array.from(MATERIALS, (m) => m.rolling);
+const SLEEP_WINDOWS = Uint8Array.from(MATERIALS, (m) => m.sleepWindows);
+const SLEEP_DRIFT2 = Float32Array.from(MATERIALS, (m) => m.sleepDrift * m.sleepDrift);
+/** Can this material hold a grain up? Water cannot: sand in it sinks. */
+const HOLDS = Uint8Array.from(MATERIALS, (m) => (m.support > 0 ? 1 : 0));
+/** The friction angle, atan(mu): how far a contact's push can lean and still
+ *  hold. See `cradled`. */
+const CRADLE_ANGLE = Float32Array.from(MATERIALS, (m) => Math.atan(m.friction));
+
+/**
+ * The liquid solver, in units of the grain radius so a different radius
+ * behaves the same. See `relaxLiquid`.
+ */
+export const FLUID = {
+  /** rest spacing between drops, in diameters. Under 1 so the drops overlap
+   *  and the painter fuses them into one surface. */
+  spacing: 0.9,
+  /** interaction radius, in diameters. Must stay under two grid cells. */
+  reach: 2.2,
+  /** pressure per unit of excess density, px - how hard water resists being
+   *  squeezed. Too soft and a deep pool compresses; too stiff and it fizzes. */
+  stiffness: 0.5,
+  /** near-pressure, px - keeps two drops from collapsing into one */
+  nearStiffness: 2.5,
+  /** fraction of the rest density a drop may be short of before it stops
+   *  pulling its neighbours in: surface tension, and the cap on it */
+  tension: 0.1,
+  /** how much of the relative motion of two neighbours is shared per step */
+  viscosity: 0.04,
+  /** fraction of the summed displacement applied per relaxation. Every drop
+   *  is pushed by ~20 neighbours at once, so the full sum overshoots and the
+   *  pool boils. */
+  relax: 0.3,
+  /** relaxations per step, re-measuring the same pairs. One is enough for a
+   *  puddle; a pool twenty drops deep needs two, or the bottom of it never
+   *  stops moving. See `relaxLiquid`. */
+  iterations: 2,
+} as const;
 
 export interface GrainOptions {
   /** every grain has the same radius, in world px */
   radius: number;
   /** px per step squared, matching Matter's convention - see `GRAVITY_ACCEL` */
   gravity: number;
-  /** relaxation passes per step; 3 is enough for a heap, 2 for a sprinkle */
+  /** contact passes per step. Fewer and a pour fluidises the heap it lands
+   *  on (3 passes stand at ~25 degrees, 5 at ~35); liquids only take two */
   iterations: number;
 }
 
 const DEFAULTS: GrainOptions = {
   radius: 5,
   gravity: GRAVITY_ACCEL,
-  iterations: 3,
+  iterations: 5,
 };
 
 /**
@@ -134,12 +199,10 @@ export interface GrainCollider {
 
 /**
  * Sleep is decided over a window of steps: a grain that has moved less than
- * `SLEEP_DRIFT` in `SLEEP_WINDOW` steps is at rest. Half a second is short
- * enough that a settled heap is free almost immediately and long enough that a
- * grain in free fall (which covers hundreds of px in that time) never qualifies.
+ * its material's `sleepDrift` in `SLEEP_WINDOW` steps has stopped. Whether it
+ * may *sleep* also needs a support - see `cradled`.
  */
 const SLEEP_WINDOW = 30;
-const SLEEP_DRIFT = 3;
 
 /** Impact speed (px/step) that counts as a real hit, for the bounce. */
 const BOUNCE_SPEED = 0.5;
@@ -147,9 +210,42 @@ const BOUNCE_SPEED = 0.5;
 /** Below this speed a contacted grain is rolling, not falling, and is damped. */
 const ROLL_SPEED = 1.5;
 
-/** A packed heap churns at ~2 px/step without going anywhere, so waking a
- *  sleeping grain needs a real impact behind it, not solver noise. */
-const WAKE_SPEED = 3;
+/** A sleeping grain wakes for a hit faster than this. Now that a heap holds
+ *  its own shape awake, waking one is harmless, so this can be low. */
+const WAKE_SPEED = 1.5;
+
+/** What left a dirty cell: anything that can hold a grain up, or only water. */
+const DIRTY_SOLID = 1;
+const DIRTY_LIQUID = 2;
+
+/** What a sleeping grain is resting on, besides sand and the floor. */
+const REST_BODY = 1;
+const REST_WATER = 2;
+
+/** How far apart, in radii past touching, two grains may be and still be
+ *  listed as a pair for the step: what the passes can close between them. */
+const CONTACT_MARGIN = 0.5;
+
+/** Share of a body of water that must be still for all of it to sleep. The
+ *  rest are drops wandering inside a pool that has stopped changing. */
+const POOL_STILL = 0.95;
+
+/** A sleeping drop wakes when an awake one runs into it faster than this,
+ *  px/step. A pool is never perfectly still, so this is a real disturbance. */
+const FLUID_WAKE = 1;
+
+/**
+ * A grain woken only to check its support gets this many steps to show that it
+ * has lost it. Free fall covers ~9 px in 8 steps; a grain that is still held up
+ * moves a fraction of that, and goes straight back to sleep. Without this, the
+ * check itself would wake a heap a layer at a time and keep it awake.
+ */
+const PROBATION = 8;
+const PROBATION_DRIFT = 2;
+
+/** Sleepers re-checked per step, as a fraction of all grains: 1/32 re-checks
+ *  the whole box twice a second. */
+const AUDIT_SHARE = 32;
 
 /** How many grains weigh as much as one body of mass 1. Sand should be heavy. */
 const GRAINS_PER_MASS = 700;
@@ -252,6 +348,18 @@ export function dragImpulse(
   return { vx: vx + nx * take, vy: vy + ny * take };
 }
 
+/**
+ * Coulomb friction on a slip of `slip` px/step, given a normal impulse of `jn`:
+ * the slip that is left. Below the cone the contact sticks and nothing is left;
+ * above it the slip loses `mu * jn` and keeps sliding.
+ */
+function coulomb(slip: number, jn: number, mu: number): number {
+  const limit = mu * jn;
+  if (slip > limit) return slip - limit;
+  if (slip < -limit) return slip + limit;
+  return 0;
+}
+
 /** Colliders are capped so a shatter storm can't turn the grain pass quadratic. */
 const MAX_COLLIDERS = 512;
 
@@ -276,8 +384,16 @@ export class GrainWorld {
   /** 1 when a grain is asleep and skipped by the solver */
   readonly asleep: Uint8Array;
 
+  /** position at the start of the step - a liquid's velocity is derived from it */
+  private readonly prevX: Float32Array;
+  private readonly prevY: Float32Array;
   /** 1 when a grain had a contact during the current step */
   private readonly touched: Uint8Array;
+  /** 1 when a body is holding the grain up this step (a face below it) */
+  private readonly onBody: Uint8Array;
+  /** what the grain fell asleep on, if the audit has to ask for more than
+   *  sand and the floor: `REST_BODY`, and/or `REST_WATER` */
+  private readonly restOn: Uint8Array;
   /** accumulated contact normal, weighted by how far it pushed this grain:
    *  the direction a grain is being supported from */
   private readonly supX: Float32Array;
@@ -289,6 +405,18 @@ export class GrainWorld {
   private readonly anchorTick: Uint8Array;
   /** consecutive quiet windows */
   private readonly quiet: Uint8Array;
+  /** steps left to prove a woken grain has lost its support - see `PROBATION` */
+  private readonly probation: Uint8Array;
+  /** where the grain was when it last told the grains above it that it moved */
+  private readonly homeX: Float32Array;
+  private readonly homeY: Float32Array;
+
+  /** the grains the solver walks this step: awake ones, in no particular order */
+  private readonly active: Int32Array;
+  private activeCount = 0;
+  /** true between bucketing and the end of the step, when a woken grain has to
+   *  join `active` and be given a start position */
+  private inStep = false;
 
   // Uniform grid, rebuilt each step with a counting sort (no allocation).
   private cols = 1;
@@ -300,6 +428,44 @@ export class GrainWorld {
   private readonly order: Int32Array;
   /** grid cell of each grain, computed once per step and reused by every pass */
   private readonly cellOf: Int32Array;
+  /** cells whose support changed since the last step, and the list of them */
+  private dirty = new Uint8Array(2);
+  private dirtyList = new Int32Array(256);
+  private dirtyCount = 0;
+  private auditCursor = 0;
+  private settleTick = 0;
+  /** this step's contact pairs, found once and walked by every pass */
+  private pairI = new Int32Array(1024);
+  private pairJ = new Int32Array(1024);
+  private pairCount = 0;
+  /** connected-water labels per grid cell, for `settleLiquid` */
+  private cellLabel = new Int32Array(2);
+  private cellStack = new Int32Array(2);
+
+  // --- liquid -------------------------------------------------------------
+  /** awake drops this step, and their neighbours found once and used twice */
+  private fluid: Int32Array;
+  private fluidCount = 0;
+  private nbrStart: Int32Array;
+  private nbr = new Int32Array(1024);
+  private nbrQ = new Float32Array(1024);
+  private nbrNx = new Float32Array(1024);
+  private nbrNy = new Float32Array(1024);
+  /** density, then (once the densities are summed) pressure */
+  private readonly rho: Float32Array;
+  /** near-density, then near-pressure */
+  private readonly rhoNear: Float32Array;
+  /** the summed displacement of each drop during the relaxation */
+  private readonly accX: Float32Array;
+  private readonly accY: Float32Array;
+  /** 1 while a drop is in this step's `fluid` list */
+  private readonly inFluid: Uint8Array;
+  /** 1 when a drop has a grain of sand close enough to touch this step: the
+   *  only drops the contact passes need to look at */
+  private readonly nearSolid: Uint8Array;
+  /** interaction radius and rest density for the current radius and grid */
+  private reach = 1;
+  private rho0 = 1;
 
   // --- colliders, rebuilt each step ---------------------------------------
   private colCount = 0;
@@ -373,15 +539,31 @@ export class GrainWorld {
     this.vy = new Float32Array(capacity);
     this.kind = new Uint8Array(capacity);
     this.asleep = new Uint8Array(capacity);
+    this.prevX = new Float32Array(capacity);
+    this.prevY = new Float32Array(capacity);
     this.touched = new Uint8Array(capacity);
+    this.onBody = new Uint8Array(capacity);
+    this.restOn = new Uint8Array(capacity);
     this.supX = new Float32Array(capacity);
     this.supY = new Float32Array(capacity);
     this.anchorX = new Float32Array(capacity);
     this.anchorY = new Float32Array(capacity);
     this.anchorTick = new Uint8Array(capacity);
     this.quiet = new Uint8Array(capacity);
+    this.probation = new Uint8Array(capacity);
+    this.homeX = new Float32Array(capacity);
+    this.homeY = new Float32Array(capacity);
+    this.active = new Int32Array(capacity);
     this.order = new Int32Array(capacity);
     this.cellOf = new Int32Array(capacity);
+    this.fluid = new Int32Array(capacity);
+    this.nbrStart = new Int32Array(capacity + 1);
+    this.rho = new Float32Array(capacity);
+    this.rhoNear = new Float32Array(capacity);
+    this.accX = new Float32Array(capacity);
+    this.accY = new Float32Array(capacity);
+    this.inFluid = new Uint8Array(capacity);
+    this.nearSolid = new Uint8Array(capacity);
 
     this.buildGrid();
   }
@@ -399,10 +581,14 @@ export class GrainWorld {
     this.vy[i] = vy;
     this.kind[i] = kind;
     this.asleep[i] = 0;
+    this.restOn[i] = 0;
     this.anchorX[i] = grainX;
     this.anchorY[i] = grainY;
     this.anchorTick[i] = 0;
     this.quiet[i] = 0;
+    this.probation[i] = 0;
+    this.homeX[i] = grainX;
+    this.homeY[i] = grainY;
     return true;
   }
 
@@ -410,10 +596,23 @@ export class GrainWorld {
     this.count = 0;
     this.awake = 0;
     this.colCount = 0;
+    this.dirtyCount = 0;
+    this.dirty.fill(0);
   }
 
-  /** The box changed size: rebuild the grid and pull everything back inside. */
+  /**
+   * The box changed size: rebuild the grid and pull everything back inside.
+   *
+   * A new floor height moves what every pile stands on, so everything wakes.
+   * A new width only matters to grains against the right wall - pulled in, or
+   * left standing against a wall that has gone - so only those wake, and the
+   * dirty cells they leave let whatever they held look again. Waking a whole
+   * heap is not free: it has to carry its own weight again from scratch, and
+   * it settles a little lower than it slept.
+   */
   resize(width: number, height: number): void {
+    const oldWidth = this.width;
+    const floorMoved = height !== this.height;
     this.width = width;
     this.height = height;
     this.buildGrid();
@@ -421,36 +620,88 @@ export class GrainWorld {
     const r = this.options.radius;
     const right = width - r;
     const bottom = height - r;
+    const oldRight = oldWidth - r - 1;
     for (let i = 0; i < this.count; i++) {
-      this.x[i] = Math.min(Math.max(this.x[i], r), right);
-      this.y[i] = Math.min(Math.max(this.y[i], r), bottom);
+      const gx = this.x[i];
+      const gy = this.y[i];
+      this.x[i] = Math.min(Math.max(gx, r), right);
+      this.y[i] = Math.min(Math.max(gy, r), bottom);
+      if (floorMoved || this.asleep[i] === 0) continue;
+      if (this.x[i] !== gx || this.y[i] !== gy || (width !== oldWidth && gx >= oldRight)) {
+        this.wake(i, PROBATION);
+        this.markDirty(this.x[i], this.y[i]);
+      }
     }
-    this.wakeAll();
+    if (floorMoved) this.wakeAll();
   }
 
+  /** Wake everything, on probation: what is still held up goes back to sleep. */
   wakeAll(): void {
-    this.asleep.fill(0);
-    this.quiet.fill(0);
-    this.anchorTick.fill(0);
+    for (let i = 0; i < this.count; i++) if (this.asleep[i] === 1) this.wake(i, PROBATION);
   }
 
-  /** Wake everything inside a box - used when a body is deleted or dragged. */
-  wakeIn(minX: number, minY: number, maxX: number, maxY: number): void {
+  /**
+   * Wake everything touching a box - used when a body is deleted or dragged.
+   * The box is grown by a grain's reach, since a grain resting on a body has
+   * its centre a radius outside the body's bounds. What is woken also leaves
+   * its cell dirty, so a pile *on top of* what was woken looks again too: the
+   * box only has to reach the first layer.
+   */
+  wakeIn(boxMinX: number, boxMinY: number, boxMaxX: number, boxMaxY: number): void {
     const x = this.x;
     const y = this.y;
+    const reach = this.options.radius * 2 + 2;
+    const minX = boxMinX - reach;
+    const minY = boxMinY - reach;
+    const maxX = boxMaxX + reach;
+    const maxY = boxMaxY + reach;
     for (let i = 0; i < this.count; i++) {
       if (this.asleep[i] === 0) continue;
       if (x[i] < minX || x[i] > maxX || y[i] < minY || y[i] > maxY) continue;
-      this.wake(i);
+      this.wake(i, PROBATION);
+      this.markDirty(x[i], y[i]);
     }
   }
 
-  private wake(i: number): void {
+  /** `probation` > 0 for a grain woken to re-check its support rather than hit. */
+  private wake(i: number, probation = 0): void {
     this.asleep[i] = 0;
+    this.probation[i] = probation;
+    this.restOn[i] = 0;
     this.quiet[i] = 0;
     this.anchorTick[i] = 0;
     this.anchorX[i] = this.x[i];
     this.anchorY[i] = this.y[i];
+    this.homeX[i] = this.x[i];
+    this.homeY[i] = this.y[i];
+    if (this.inStep) {
+      // Woken mid-step: it has to be walked by the rest of this step, and it
+      // has not moved yet, so its start position is where it is. A drop woken
+      // here missed the relaxation's look round, so it takes its contacts.
+      this.active[this.activeCount++] = i;
+      this.nearSolid[i] = 1;
+      this.prevX[i] = this.x[i];
+      this.prevY[i] = this.y[i];
+    }
+  }
+
+  /** Something under this point went away: the sleepers around and above it
+   *  have to check that they are still held up. `what` says whether it could
+   *  have been holding anything but water (`DIRTY_SOLID`) or was only a drop
+   *  (`DIRTY_LIQUID`), which never held a grain of sand up. */
+  private markDirty(px: number, py: number, what = DIRTY_SOLID): void {
+    const cx = Math.min(this.cols - 1, Math.max(0, (px / this.cellW) | 0));
+    const cy = Math.min(this.rows - 1, Math.max(0, (py / this.cellH) | 0));
+    const cell = cy * this.cols + cx;
+    const was = this.dirty[cell];
+    this.dirty[cell] = was | what;
+    if (was !== 0) return;
+    if (this.dirtyCount === this.dirtyList.length) {
+      const next = new Int32Array(this.dirtyList.length * 2);
+      next.set(this.dirtyList);
+      this.dirtyList = next;
+    }
+    this.dirtyList[this.dirtyCount++] = cell;
   }
 
   /** Erase grains inside a circle. O(1) per grain: swap the last one into the hole. */
@@ -465,6 +716,9 @@ export class GrainWorld {
       const dy = y[i] - centerY;
       if (dx * dx + dy * dy > r2) continue;
 
+      // Whatever was resting on this grain has lost its support.
+      this.markDirty(x[i], y[i]);
+
       const last = --this.count;
       if (i !== last) {
         x[i] = x[last];
@@ -473,10 +727,14 @@ export class GrainWorld {
         this.vy[i] = this.vy[last];
         this.kind[i] = this.kind[last];
         this.asleep[i] = this.asleep[last];
+        this.restOn[i] = this.restOn[last];
         this.anchorX[i] = this.anchorX[last];
         this.anchorY[i] = this.anchorY[last];
         this.anchorTick[i] = this.anchorTick[last];
         this.quiet[i] = this.quiet[last];
+        this.probation[i] = this.probation[last];
+        this.homeX[i] = this.homeX[last];
+        this.homeY[i] = this.homeY[last];
       }
       removed++;
     }
@@ -494,8 +752,10 @@ export class GrainWorld {
   private buildGrid(): void {
     // Cells are just over two radii across: the smallest size that still finds
     // every contact with a 3x3 stencil. Bigger cells mean more candidate pairs
-    // per grain, which is what this loop spends its time on.
-    const cell = Math.max(4, this.options.radius * 2 + 2);
+    // per grain, which is what this loop spends its time on. Liquids reach two
+    // cells out (a 5x5 stencil) instead of needing a coarser grid of their own.
+    const r = this.options.radius;
+    const cell = Math.max(4, r * 2 + 2);
     this.cols = Math.max(1, Math.ceil(this.width / cell));
     this.rows = Math.max(1, Math.ceil(this.height / cell));
     this.cellW = this.width / this.cols;
@@ -503,6 +763,13 @@ export class GrainWorld {
     const cells = this.cols * this.rows + 1;
     this.cellStart = new Int32Array(cells);
     this.cellFill = new Int32Array(cells);
+    this.dirty = new Uint8Array(cells);
+    this.dirtyCount = 0;
+    this.cellLabel = new Int32Array(cells);
+    this.cellStack = new Int32Array(cells);
+
+    this.reach = Math.min(FLUID.reach * 2 * r, 2 * Math.min(this.cellW, this.cellH) - 0.01);
+    this.rho0 = restDensity(FLUID.spacing * 2 * r, this.reach);
   }
 
   /** One fixed step. The engine always passes one 60 Hz tick. */
@@ -511,28 +778,51 @@ export class GrainWorld {
     if (n === 0) {
       this.colCount = 0;
       this.awake = 0;
+      this.dirtyCount = 0;
       return;
     }
 
     this.updateColliders(colliders);
+    this.integrate();
+    this.bucket();
 
-    const { radius: r, gravity, iterations } = this.options;
-    const x = this.x;
-    const y = this.y;
-    const vx = this.vx;
-    const vy = this.vy;
-    const kind = this.kind;
-    const asleep = this.asleep;
-    const width = this.width;
-    const height = this.height;
+    this.inStep = true;
+    this.wakeDirty();
+    this.audit();
 
-    // --- integrate ---------------------------------------------------------
+    if (this.fluidCount > 0) this.relaxLiquid();
+    this.findContacts();
+    for (let pass = 0; pass < this.options.iterations; pass++) this.solveContacts(pass);
+    if (this.fluidCount > 0) this.liquidVelocity();
+
+    this.collideBodies();
+    this.holdVelocity();
+    this.finish();
+    if (++this.settleTick >= SLEEP_WINDOW) {
+      this.settleTick = 0;
+      this.settleLiquid();
+    }
+    this.inStep = false;
+  }
+
+  // --- the step, in order --------------------------------------------------
+
+  /** Gravity, then move. Also lists who is awake and who of those is liquid. */
+  private integrate(): void {
+    const n = this.count;
+    const { radius: r, gravity } = this.options;
+    const { x, y, vx, vy, asleep, kind, prevX, prevY, active, fluid } = this;
+
     // A grain may not travel further in one step than the solver can resolve,
     // or it can tunnel through a thin body or through a wall of other grains.
     const maxStep = r * 2.5;
     const maxStepSq = maxStep * maxStep;
+    let count = 0;
+    let drops = 0;
     for (let i = 0; i < n; i++) {
       if (asleep[i] === 1) continue;
+      active[count++] = i;
+      if (LIQUID[kind[i]] === 1) fluid[drops++] = i;
       vy[i] += gravity;
       const v2 = vx[i] * vx[i] + vy[i] * vy[i];
       if (v2 > maxStepSq) {
@@ -540,188 +830,505 @@ export class GrainWorld {
         vx[i] *= k;
         vy[i] *= k;
       }
+      prevX[i] = x[i];
+      prevY[i] = y[i];
       x[i] += vx[i];
       y[i] += vy[i];
     }
+    this.activeCount = count;
+    this.fluidCount = drops;
+  }
 
-    // --- bucket ------------------------------------------------------------
-    // Asleep grains are bucketed too: an awake grain has to be able to find
-    // them, or it would sink straight through a settled pile.
-    const cols = this.cols;
-    const rows = this.rows;
-    const cellW = this.cellW;
-    const cellH = this.cellH;
-    const cellStart = this.cellStart;
-    const cellFill = this.cellFill;
-    const order = this.order;
-    const cellOf = this.cellOf;
+  /** Counting sort into the grid. Asleep grains are bucketed too: an awake
+   *  grain has to be able to find them, or it would sink through a pile. */
+  private bucket(): void {
+    const n = this.count;
+    const { x, y, cols, rows, cellW, cellH, cellStart, cellFill, order, cellOf } = this;
 
     cellStart.fill(0);
     for (let i = 0; i < n; i++) {
       const cx = Math.min(cols - 1, Math.max(0, (x[i] / cellW) | 0));
       const cy = Math.min(rows - 1, Math.max(0, (y[i] / cellH) | 0));
-      cellStart[cy * cols + cx + 1]++;
+      const cell = cy * cols + cx;
+      cellOf[i] = cell;
+      cellStart[cell + 1]++;
     }
     for (let c = 1, cells = cols * rows; c <= cells; c++) cellStart[c] += cellStart[c - 1];
 
     cellFill.set(cellStart);
-    for (let i = 0; i < n; i++) {
-      const cx = Math.min(cols - 1, Math.max(0, (x[i] / cellW) | 0));
-      const cy = Math.min(rows - 1, Math.max(0, (y[i] / cellH) | 0));
-      const cell = cy * cols + cx;
-      cellOf[i] = cell;
-      order[cellFill[cell]++] = i;
-    }
+    for (let i = 0; i < n; i++) order[cellFill[cellOf[i]]++] = i;
+  }
 
-    // --- relax -------------------------------------------------------------
-    const minDist = r * 2;
-    const minDistSq = minDist * minDist;
-    // Cohesion reaches 35% past contact, which still fits the 3x3 stencil:
-    // cells are 2r+2 across, so the far corner of the stencil is 2r+3 out.
-    const cohesionSq = minDistSq * 1.82;
-    const cohesionBand = minDist * 0.35;
+  /**
+   * Wake the sleepers in and beside every dirty cell, and in the row above it:
+   * the grains that may have been resting on whatever left. They fall if they
+   * have to, and leave dirty cells of their own as they go, so a collapse
+   * spreads exactly as far as the support it lost.
+   */
+  private wakeDirty(): void {
+    const { cols, cellStart, order, asleep, kind, restOn, dirty, dirtyList } = this;
     const lastCol = cols - 1;
-    const lastRow = rows - 1;
-    const touched = this.touched;
-    const supX = this.supX;
-    const supY = this.supY;
-    touched.fill(0, 0, n);
-    supX.fill(0, 0, n);
-    supY.fill(0, 0, n);
-
-    for (let pass = 0; pass < iterations; pass++) {
-      for (let i = 0; i < n; i++) {
-        if (asleep[i] === 1) continue;
-
-        // The cell recorded at bucketing time. A grain can't travel a whole
-        // cell in one step, so this stays a valid hint for the 3x3 stencil.
-        const cell = cellOf[i];
-        const matI = MATERIALS[kind[i]];
-        const cy = (cell / cols) | 0;
-        const cx = cell - cy * cols;
-
-        const gy0 = cy > 0 ? cy - 1 : 0;
-        const gy1 = cy < lastRow ? cy + 1 : lastRow;
-        const gx0 = cx > 0 ? cx - 1 : 0;
-        const gx1 = cx < lastCol ? cx + 1 : lastCol;
-
-        for (let gy = gy0; gy <= gy1; gy++) {
-          const rowBase = gy * cols;
-
-          for (let gx = gx0; gx <= gx1; gx++) {
-            const start = cellStart[rowBase + gx];
-            const end = cellStart[rowBase + gx + 1];
-
-            for (let k = start; k < end; k++) {
-              const j = order[k];
-              if (j === i) continue;
-              // Visit each pair once - except when `j` is asleep, because a
-              // sleeping grain is never the outer index and the pair would
-              // otherwise never be looked at at all.
-              if (j < i && asleep[j] === 0) continue;
-
-              // Re-read: i moves as earlier contacts in this cell are resolved.
-              const xi = x[i];
-              const yi = y[i];
-              const dx = x[j] - xi;
-              const dy = y[j] - yi;
-              const d2 = dx * dx + dy * dy;
-
-              if (d2 >= cohesionSq) continue;
-
-              if (d2 >= minDistSq) {
-                // In the gap: no contact, but two cohesive grains pull on each
-                // other. Surface tension is what makes water a puddle.
-                if (asleep[j] === 1) continue;
-                const pull = (matI.cohesion + MATERIALS[kind[j]].cohesion) * 0.5;
-                if (pull === 0 || d2 === 0) continue;
-                const d = Math.sqrt(d2);
-                const g = pull * (1 - (d - minDist) / cohesionBand);
-                if (g <= 0) continue;
-                const nx = dx / d;
-                const ny = dy / d;
-                x[i] = xi + nx * g;
-                y[i] = yi + ny * g;
-                x[j] -= nx * g;
-                y[j] -= ny * g;
-                continue;
-              }
-
-              if (d2 === 0) continue;
-
-              const d = Math.sqrt(d2);
-              const nx = dx / d;
-              const ny = dy / d;
-              const rvx = vx[j] - vx[i];
-              const rvy = vy[j] - vy[i];
-              const normalSpeed = rvx * nx + rvy * ny;
-
-              // A sleeping grain only wakes for a real impact. Waking it for
-              // every touch would cascade through a settled heap - each grain
-              // would wake its neighbour in turn and nothing would ever sleep.
-              if (asleep[j] === 1 && -normalSpeed > WAKE_SPEED) this.wake(j);
-              // Until it wakes, it is a wall: the awake grain takes the whole
-              // correction, and nothing is pushed into the sleeping one. That
-              // matters - letting awake grains sink into a sleeping patch
-              // leaves a pile full of overlaps that all resolve at once the
-              // moment something wakes it, which looks like a small explosion.
-              const fixed = asleep[j] === 1;
-
-              const push = Math.min(minDist - d, r * 1.2) * (fixed ? 1 : 0.5);
-              x[i] = xi - nx * push;
-              y[i] = yi - ny * push;
-              if (!fixed) {
-                x[j] += nx * push;
-                y[j] += ny * push;
-              }
-              touched[i] = 1;
-              // Remember which way this grain was pushed: that is the direction
-              // it is supported from, and the one its velocity has to lose.
-              supX[i] -= nx * push;
-              supY[i] -= ny * push;
-              if (fixed) continue;
-              touched[j] = 1;
-              supX[j] += nx * push;
-              supY[j] += ny * push;
-
-              if (normalSpeed >= 0) continue; // already separating
-
-              // Velocity: an inelastic impulse along the normal, plus friction
-              // on the tangent. Sand barely bounces, so restitution only
-              // applies to a hard hit - otherwise a resting heap buzzes.
-              const matJ = MATERIALS[kind[j]];
-              const bouncy = -normalSpeed > BOUNCE_SPEED ? (matI.restitution + matJ.restitution) * 0.5 : 0;
-              const bounce = (-(1 + bouncy) * normalSpeed) * 0.5;
-              vx[i] -= bounce * nx;
-              vy[i] -= bounce * ny;
-              vx[j] += bounce * nx;
-              vy[j] += bounce * ny;
-
-              const tangent = rvx * -ny + rvy * nx;
-              if (tangent !== 0) {
-                const grip = tangent * ((matI.friction + matJ.friction) * 0.5) * 0.5;
-                vx[i] += grip * -ny;
-                vy[i] += grip * nx;
-                vx[j] -= grip * -ny;
-                vy[j] -= grip * nx;
-              }
+    for (let d = 0; d < this.dirtyCount; d++) {
+      const cell = dirtyList[d];
+      const solid = (dirty[cell] & DIRTY_SOLID) !== 0;
+      dirty[cell] = 0;
+      const cy = (cell / cols) | 0;
+      const cx = cell - cy * cols;
+      const gx0 = cx > 0 ? cx - 1 : 0;
+      const gx1 = cx < lastCol ? cx + 1 : lastCol;
+      for (let gy = cy > 0 ? cy - 1 : 0; gy <= cy; gy++) {
+        for (let gx = gx0; gx <= gx1; gx++) {
+          const c = gy * cols + gx;
+          for (let k = cellStart[c]; k < cellStart[c + 1]; k++) {
+            const j = order[k];
+            if (asleep[j] === 1 && (solid || LIQUID[kind[j]] === 1 || (restOn[j] & REST_WATER) !== 0)) {
+              this.wake(j, PROBATION);
             }
           }
         }
       }
     }
+    this.dirtyCount = 0;
+  }
 
-    // --- rigid bodies ------------------------------------------------------
-    this.collideBodies();
+  /**
+   * The safety net under `wakeDirty`: re-check a slice of the sleepers every
+   * step, and wake any that nothing is holding up any more - a body that slid
+   * out too slowly to wake what it carried, say.
+   */
+  private audit(): void {
+    const n = this.count;
+    const span = Math.max(1, Math.ceil(n / AUDIT_SHARE));
+    let i = this.auditCursor >= n ? 0 : this.auditCursor;
+    for (let k = 0; k < span; k++) {
+      if (this.asleep[i] === 1) {
+        const rest = this.restOn[i];
+        const held = ((rest & REST_BODY) !== 0 && this.nearBody(i)) || this.cradled(i, (rest & REST_WATER) !== 0);
+        if (!held) {
+          this.wake(i);
+          this.markDirty(this.x[i], this.y[i]);
+        }
+      }
+      if (++i >= n) i = 0;
+    }
+    this.auditCursor = i;
+  }
 
-    // --- kill the velocity that contacts are holding ------------------------
-    // A grain resting on a pile picks up one gravity step per frame and is
-    // pushed straight back out of the contact; the position comes back but the
-    // velocity never does, so the heap churns for ever without going anywhere.
-    // The support direction says which part of that velocity is being held, so
-    // remove exactly that. Tangential motion (sliding, flowing) is untouched,
-    // which is why a stream keeps falling while a pile stops.
-    for (let i = 0; i < n; i++) {
+  /**
+   * The liquid: double-density relaxation (Clavet et al. 2005).
+   *
+   * Each drop sums its neighbours twice: a density (how crowded it is) and a
+   * near-density (how close the closest ones are). Pressure is the excess over
+   * the rest density and pushes neighbours apart along the line between them;
+   * near-pressure is always repulsive and keeps drops from merging. A drop
+   * short of its rest density pulls a little (surface tension), capped at
+   * `FLUID.tension` so a stray pair does not collapse into one.
+   *
+   * Sand and sleeping drops count towards a drop's density - they are the
+   * walls of the pool - but only an awake drop is moved.
+   *
+   * The displacements are summed and applied together (Jacobi), not one pair
+   * at a time. Applied in place, each drop sees the ones before it in index
+   * order already moved, and that bias is not noise: it drives a steady
+   * current along the bottom of a pool that is otherwise level, so no drop in
+   * it ever stops. Summed, what is left is a jitter that goes nowhere, and a
+   * still pool can sleep. It also means every pair is measured once.
+   */
+  private relaxLiquid(): void {
+    const { x, y, vx, vy, kind, asleep, prevX, prevY, cols, rows, cellStart, order, cellOf, fluid } = this;
+    const { rho, rhoNear, inFluid, nearSolid } = this;
+    const h = this.reach;
+    const h2 = h * h;
+    const rho0 = this.rho0;
+    const r = this.options.radius;
+    const solid2 = (2 * r + 4) * (2 * r + 4);
+    const k = FLUID.stiffness;
+    const kNear = FLUID.nearStiffness;
+    const floorP = -k * rho0 * FLUID.tension;
+    const visc = FLUID.viscosity;
+    const maxD = r * 0.5;
+    const lastCol = cols - 1;
+    const lastRow = rows - 1;
+    const drops = this.fluidCount;
+
+    for (let f = 0; f < drops; f++) {
+      const i = fluid[f];
+      inFluid[i] = 1;
+      rho[i] = 0;
+      rhoNear[i] = 0;
+    }
+
+    // Pass 1: neighbours and densities. A pair of awake drops is found from
+    // its lower index only and counted for both; anything else - sand, or a
+    // sleeping drop - is only ever a neighbour, so it is kept on this side.
+    let at = 0;
+    for (let f = 0; f < drops; f++) {
+      const i = fluid[f];
+      this.nbrStart[f] = at;
+      if (this.nbr.length < at + 64) this.growNeighbours((at + 64) * 2);
+
+      const cell = cellOf[i];
+      const cy = (cell / cols) | 0;
+      const cx = cell - cy * cols;
+      const xi = x[i];
+      const yi = y[i];
+      let density = rho[i];
+      let near = rhoNear[i];
+      let solid = 0;
+      for (let gy = cy > 1 ? cy - 2 : 0, gy1 = cy < lastRow - 1 ? cy + 2 : lastRow; gy <= gy1; gy++) {
+        const rowBase = gy * cols;
+        for (let gx = cx > 1 ? cx - 2 : 0, gx1 = cx < lastCol - 1 ? cx + 2 : lastCol; gx <= gx1; gx++) {
+          for (let s = cellStart[rowBase + gx], e = cellStart[rowBase + gx + 1]; s < e; s++) {
+            const j = order[s];
+            const partner = inFluid[j] === 1;
+            if (partner ? j <= i : j === i) continue;
+            const dx = x[j] - xi;
+            const dy = y[j] - yi;
+            const d2 = dx * dx + dy * dy;
+            if (d2 >= h2 || d2 === 0) continue;
+            if (LIQUID[kind[j]] === 0 && d2 < solid2) solid = 1;
+            const d = Math.sqrt(d2);
+            const q = 1 - d / h;
+            const q2 = q * q;
+            density += q2;
+            near += q2 * q;
+            if (partner) {
+              rho[j] += q2;
+              rhoNear[j] += q2 * q;
+            }
+            if (at === this.nbr.length) this.growNeighbours(at * 2);
+            this.nbr[at] = j;
+            this.nbrQ[at] = q;
+            this.nbrNx[at] = dx / d;
+            this.nbrNy[at] = dy / d;
+            at++;
+          }
+        }
+      }
+      rho[i] = density;
+      rhoNear[i] = near;
+      nearSolid[i] = solid;
+    }
+    this.nbrStart[drops] = at;
+
+    // Two smaller relaxations rather than one big one. A drop at the bottom of
+    // a deep pool is squeezed until it has more neighbours inside the kernel
+    // than one at the surface, so the summed push is larger there; a single
+    // relaxation stiff enough to hold the column up overshoots at the bottom
+    // and the pool boils for ever, and one soft enough to be stable lets it
+    // compress by a third. The second pass re-measures the same pairs - the
+    // grid search is not repeated.
+    const { nbr, nbrQ, nbrNx, nbrNy, nbrStart, accX, accY } = this;
+    const relax = FLUID.relax;
+    for (let iteration = 0; iteration < FLUID.iterations; iteration++) {
+      if (iteration > 0) {
+        for (let f = 0; f < drops; f++) {
+          const i = fluid[f];
+          rho[i] = 0;
+          rhoNear[i] = 0;
+        }
+        for (let f = 0; f < drops; f++) {
+          const i = fluid[f];
+          const xi = x[i];
+          const yi = y[i];
+          for (let s = nbrStart[f], e = nbrStart[f + 1]; s < e; s++) {
+            const j = nbr[s];
+            const dx = x[j] - xi;
+            const dy = y[j] - yi;
+            const d2 = dx * dx + dy * dy;
+            if (d2 >= h2 || d2 === 0) {
+              nbrQ[s] = 0;
+              continue;
+            }
+            const d = Math.sqrt(d2);
+            const q = 1 - d / h;
+            const q2 = q * q;
+            nbrQ[s] = q;
+            nbrNx[s] = dx / d;
+            nbrNy[s] = dy / d;
+            rho[i] += q2;
+            rhoNear[i] += q2 * q;
+            if (inFluid[j] === 1) {
+              rho[j] += q2;
+              rhoNear[j] += q2 * q;
+            }
+          }
+        }
+      }
+
+      // Densities to pressures, in place: nothing reads a density after this.
+      for (let f = 0; f < drops; f++) {
+        const i = fluid[f];
+        const p = k * (rho[i] - rho0);
+        rho[i] = p < floorP ? floorP : p;
+        rhoNear[i] = kNear * rhoNear[i];
+      }
+
+      // Pass 2: displacements, summed.
+      for (let f = 0; f < drops; f++) {
+        const i = fluid[f];
+        const pi = rho[i];
+        const pni = rhoNear[i];
+        const dix = x[i] - prevX[i];
+        const diy = y[i] - prevY[i];
+
+        for (let s = this.nbrStart[f], e = this.nbrStart[f + 1]; s < e; s++) {
+          const j = nbr[s];
+          const q = nbrQ[s];
+          const nx = nbrNx[s];
+          const ny = nbrNy[s];
+          let push = pi * q + pni * q * q;
+          if (push > maxD) push = maxD;
+          else if (push < -maxD) push = -maxD;
+
+          if (inFluid[j] === 1) {
+            // Both drops' pressures, shared equally.
+            let pushJ = rho[j] * q + rhoNear[j] * q * q;
+            if (pushJ > maxD) pushJ = maxD;
+            else if (pushJ < -maxD) pushJ = -maxD;
+            const shove = (push + pushJ) * 0.5;
+            // Viscosity: share a little of the pair's relative motion.
+            const m = visc * q;
+            const rx = (x[j] - prevX[j] - dix) * m;
+            const ry = (y[j] - prevY[j] - diy) * m;
+            accX[i] += rx - nx * shove;
+            accY[i] += ry - ny * shove;
+            accX[j] -= rx - nx * shove;
+            accY[j] -= ry - ny * shove;
+          } else if (LIQUID[kind[j]] === 1) {
+            // A sleeping drop: still water. An awake pair moves each drop by the
+            // mean of their two pushes; the sleeper's pressure is not known, but
+            // it is still water next to this drop, so its push is taken as the
+            // same - and this drop, the only one that can move, takes all of it.
+            // (Half of it leaves a drop woken inside a sleeping pool with half
+            // its support, and it falls through and wakes the rest.) It wakes
+            // the sleeper for a drop that is really moving into it.
+            if (asleep[j] === 1 && vx[i] * nx + vy[i] * ny > FLUID_WAKE) this.wake(j);
+            accX[i] -= nx * push;
+            accY[i] -= ny * push;
+          } else if (push > 0) {
+            // Sand: a wall. This drop takes all of it, and does not stick to it.
+            accX[i] -= nx * push;
+            accY[i] -= ny * push;
+          }
+        }
+      }
+
+      for (let f = 0; f < drops; f++) {
+        const i = fluid[f];
+        x[i] += accX[i] * relax;
+        y[i] += accY[i] * relax;
+        accX[i] = 0;
+        accY[i] = 0;
+      }
+    }
+    for (let f = 0; f < drops; f++) inFluid[fluid[f]] = 0;
+  }
+
+  private growNeighbours(size: number): void {
+    const grow = <T extends Int32Array | Float32Array>(a: T, make: (n: number) => T): T => {
+      const next = make(size);
+      next.set(a);
+      return next;
+    };
+    this.nbr = grow(this.nbr, (n) => new Int32Array(n));
+    this.nbrQ = grow(this.nbrQ, (n) => new Float32Array(n));
+    this.nbrNx = grow(this.nbrNx, (n) => new Float32Array(n));
+    this.nbrNy = grow(this.nbrNy, (n) => new Float32Array(n));
+  }
+
+  /**
+   * Every pair that can touch this step, each once: an awake grain and a
+   * neighbour within reach - asleep, or awake with a higher index, or a drop
+   * that the relaxation said has no sand by it (so it never looks itself).
+   * Drop-drop pairs are the liquid's and are left out.
+   */
+  private findContacts(): void {
+    const { x, y, kind, asleep, cols, rows, cellStart, order, cellOf, active, nearSolid } = this;
+    const r = this.options.radius;
+    const reach = r * 2 + r * CONTACT_MARGIN;
+    const reachSq = reach * reach;
+    const lastCol = cols - 1;
+    const lastRow = rows - 1;
+    let at = 0;
+
+    for (let a = 0; a < this.activeCount; a++) {
+      const i = active[a];
+      if (asleep[i] === 1) continue;
+      const liquidI = LIQUID[kind[i]];
+      if (liquidI === 1 && nearSolid[i] === 0) continue;
+      const xi = x[i];
+      const yi = y[i];
+
+      const cell = cellOf[i];
+      const cy = (cell / cols) | 0;
+      const cx = cell - cy * cols;
+      const gy0 = cy > 0 ? cy - 1 : 0;
+      const gy1 = cy < lastRow ? cy + 1 : lastRow;
+      const gx0 = cx > 0 ? cx - 1 : 0;
+      const gx1 = cx < lastCol ? cx + 1 : lastCol;
+
+      for (let gy = gy0; gy <= gy1; gy++) {
+        const rowBase = gy * cols;
+        for (let gx = gx0; gx <= gx1; gx++) {
+          for (let s = cellStart[rowBase + gx], e = cellStart[rowBase + gx + 1]; s < e; s++) {
+            const j = order[s];
+            if (j === i) continue;
+            const liquidJ = LIQUID[kind[j]];
+            if (liquidI === 1 && liquidJ === 1) continue;
+            // Visit each awake pair once. A sleeping grain is never the outer
+            // index, so a pair with one is always found from this side; nor
+            // is a drop that is not looking.
+            if (j < i && asleep[j] === 0 && !(liquidJ === 1 && nearSolid[j] === 0)) continue;
+            const dx = x[j] - xi;
+            const dy = y[j] - yi;
+            if (dx * dx + dy * dy >= reachSq) continue;
+            if (at === this.pairI.length) {
+              this.pairI = growInt(this.pairI, at * 2);
+              this.pairJ = growInt(this.pairJ, at * 2);
+            }
+            this.pairI[at] = i;
+            this.pairJ[at] = j;
+            at++;
+          }
+        }
+      }
+    }
+    this.pairCount = at;
+  }
+
+  /**
+   * Disc contacts with Coulomb friction. Drop-drop pairs are the liquid's, and
+   * a drop only takes part in the first two passes: the extra passes are what
+   * a sand heap needs to carry its own weight, and water has pressure for that.
+   *
+   * The pairs are found once per step (`findContacts`) and every pass walks
+   * that list: a grain moves a fraction of a radius in a step, so the pairs
+   * that can touch do not change between passes, and scanning nine cells five
+   * times over was most of the cost of a heap.
+   */
+  private solveContacts(pass: number): void {
+    const { x, y, vx, vy, kind, asleep, touched, supX, supY, pairI, pairJ } = this;
+    const { prevX, prevY } = this;
+    const r = this.options.radius;
+    const minDist = r * 2;
+    const minDistSq = minDist * minDist;
+    const maxPush = r * 1.2;
+    const liquidPasses = 2;
+
+    for (let p = 0, pairs = this.pairCount; p < pairs; p++) {
+      const i = pairI[p];
+      const j = pairJ[p];
+      const ki = kind[i];
+      const kj = kind[j];
+      if (pass >= liquidPasses && (LIQUID[ki] === 1 || LIQUID[kj] === 1)) continue;
+      const wi = INV_MASS[ki];
+      const fixed = asleep[j] === 1;
+
+      // Re-read: both move as earlier pairs are resolved.
+      const xi = x[i];
+      const yi = y[i];
+      const dx = x[j] - xi;
+      const dy = y[j] - yi;
+      const d2 = dx * dx + dy * dy;
+      if (d2 >= minDistSq || d2 === 0) continue;
+
+      const d = Math.sqrt(d2);
+      const nx = dx / d;
+      const ny = dy / d;
+      const rvx = vx[j] - vx[i];
+      const rvy = vy[j] - vy[i];
+      const normalSpeed = rvx * nx + rvy * ny;
+
+      // A sleeping grain wakes for a real hit. It used to need a hard
+      // one, because a woken heap slumped; with friction it holds. A sleeping
+      // drop also wakes for any sand pressing on it: water cannot hold sand
+      // up, and a frozen drop would.
+      if (fixed && (-normalSpeed > WAKE_SPEED || (HOLDS[kj] === 0 && HOLDS[ki] === 1))) this.wake(j);
+      else if (this.probation[j] !== 0 && -normalSpeed > WAKE_SPEED) this.probation[j] = 0;
+      const wj = asleep[j] === 1 ? 0 : INV_MASS[kj];
+      const wsum = wi + wj;
+
+      // Position: share the overlap by inverse mass. A sleeper is a wall.
+      const pen = Math.min(minDist - d, maxPush);
+      const pi = (pen * wi) / wsum;
+      const pj = (pen * wj) / wsum;
+      x[i] = xi - nx * pi;
+      y[i] = yi - ny * pi;
+      x[j] += nx * pj;
+      y[j] += ny * pj;
+
+      // Friction on the correction too. The push-out is along the normal,
+      // so a grain on a slope that fell one gravity step and was pushed
+      // back out ends up a little way downhill: g*sin(slope) per step, a
+      // creep that no amount of velocity friction can see. Cancel the
+      // pair's tangential drift this step, if it is inside the cone.
+      const tx = -ny;
+      const ty = nx;
+      const muIJ = (MU[ki] + MU[kj]) * 0.5;
+      // (A sleeper has not moved this step, whatever its stale start says.)
+      const djx = wj === 0 ? 0 : x[j] - prevX[j];
+      const djy = wj === 0 ? 0 : y[j] - prevY[j];
+      const driftT = (djx - (x[i] - prevX[i])) * tx + (djy - (y[i] - prevY[i])) * ty;
+      // Static part only: a fast grain must not drag the surface along.
+      const stick = (Math.abs(driftT) <= muIJ * pen ? driftT : 0) / wsum;
+      x[i] += tx * stick * wi;
+      y[i] += ty * stick * wi;
+      x[j] -= tx * stick * wj;
+      y[j] -= ty * stick * wj;
+      // Which way each was pushed: the direction it is held from. A
+      // sleeper is not walked by `finish`, so it must not be marked.
+      touched[i] = 1;
+      supX[i] -= nx * pi;
+      supY[i] -= ny * pi;
+      if (wj !== 0) {
+        touched[j] = 1;
+        supX[j] += nx * pj;
+        supY[j] += ny * pj;
+      }
+
+      if (normalSpeed >= 0) continue; // already separating
+
+      // Velocity: an inelastic impulse along the normal - restitution
+      // only for a real hit, or a resting heap buzzes - and Coulomb
+      // friction on the tangent, bounded by that impulse. Below the cone
+      // the slip is cancelled outright: that is static friction, and it
+      // is what holds a slope.
+      const e = -normalSpeed > BOUNCE_SPEED ? (BOUNCE[ki] + BOUNCE[kj]) * 0.5 : 0;
+      const jn = (-(1 + e) * normalSpeed) / wsum;
+      const slip = rvx * tx + rvy * ty;
+      const jt = (slip - coulomb(slip, jn * wsum, muIJ)) / wsum;
+
+      vx[i] += (-nx * jn + tx * jt) * wi;
+      vy[i] += (-ny * jn + ty * jt) * wi;
+      vx[j] += (nx * jn - tx * jt) * wj;
+      vy[j] += (ny * jn - ty * jt) * wj;
+    }
+  }
+
+  /** A drop's velocity is where it went: no impulse model for the liquid. */
+  private liquidVelocity(): void {
+    const { x, y, vx, vy, prevX, prevY, fluid, asleep } = this;
+    for (let f = 0; f < this.fluidCount; f++) {
+      const i = fluid[f];
+      if (asleep[i] === 1) continue;
+      vx[i] = x[i] - prevX[i];
+      vy[i] = y[i] - prevY[i];
+    }
+  }
+
+  /**
+   * Kill the velocity that contacts are holding. A grain resting on a pile
+   * picks up one gravity step per frame and is pushed straight back out of the
+   * contact; the position comes back but the velocity never does, so the heap
+   * would churn for ever without going anywhere. The support direction says
+   * which part of that velocity is being held, so remove exactly that.
+   * Tangential motion is untouched: friction already had its say.
+   */
+  private holdVelocity(): void {
+    const { vx, vy, supX, supY, active, asleep } = this;
+    for (let a = 0; a < this.activeCount; a++) {
+      const i = active[a];
       if (asleep[i] === 1) continue;
       const sx = supX[i];
       const sy = supY[i];
@@ -737,74 +1344,299 @@ export class GrainWorld {
         vy[i] -= vn * ny;
       }
     }
+  }
 
-    // --- walls, sleep ------------------------------------------------------
+  /** Rolling resistance, the walls, the dirty cells a mover leaves, and sleep. */
+  private finish(): void {
+    const { x, y, vx, vy, kind, asleep, touched, onBody, supX, supY, active } = this;
+    const { anchorX, anchorY, anchorTick, quiet, homeX, homeY } = this;
+    const r = this.options.radius;
     const left = r;
-    const right = width - r;
+    const right = this.width - r;
     const top = r;
-    const bottom = height - r;
-    const anchorX = this.anchorX;
-    const anchorY = this.anchorY;
-    const anchorTick = this.anchorTick;
-    const quiet = this.quiet;
+    const bottom = this.height - r;
+    const r2 = r * r;
     let awake = 0;
 
-    for (let i = 0; i < n; i++) {
+    for (let a = 0; a < this.activeCount; a++) {
+      const i = active[a];
       if (asleep[i] === 1) continue;
-
-      const material = MATERIALS[kind[i]];
-      const bouncy = (speed: number): number =>
-        Math.abs(speed) > BOUNCE_SPEED ? material.restitution : 0;
+      const ki = kind[i];
+      const mu = MU[ki];
+      const liquid = LIQUID[ki] === 1;
 
       // Rolling resistance: only for a grain that is already slow and touching
       // something, so a falling stream is untouched and a lone grain rolling
       // across a flat floor eventually stops instead of orbiting for ever.
-      if (touched[i] === 1) {
+      // Not on a body: it is relative to what the grain rolls on, and a belt
+      // moves. Friction against the face already holds it there.
+      if (touched[i] === 1 && onBody[i] === 0) {
         const speed = Math.abs(vx[i]) + Math.abs(vy[i]);
         if (speed < ROLL_SPEED) {
-          vx[i] *= material.rolling;
-          vy[i] *= material.rolling;
+          vx[i] *= ROLLING[ki];
+          vy[i] *= ROLLING[ki];
         }
       }
 
-      if (x[i] < left) {
-        x[i] = left;
-        vx[i] = Math.abs(vx[i]) * bouncy(vx[i]);
-      } else if (x[i] > right) {
-        x[i] = right;
-        vx[i] = -Math.abs(vx[i]) * bouncy(vx[i]);
+      // Walls. The floor and the sides carry Coulomb friction for a solid, so
+      // the foot of a heap grips the floor instead of skating outwards.
+      if (x[i] < left || x[i] > right) {
+        const into = Math.abs(vx[i]);
+        x[i] = x[i] < left ? left : right;
+        const sign = x[i] === left ? 1 : -1;
+        vx[i] = sign * into * (into > BOUNCE_SPEED ? BOUNCE[ki] : 0);
+        if (!liquid) vy[i] = coulomb(vy[i], into, mu);
       }
-
       if (y[i] > bottom) {
+        const into = Math.max(0, vy[i]);
         y[i] = bottom;
-        vy[i] = -Math.abs(vy[i]) * bouncy(vy[i]);
-        vx[i] *= 1 - material.friction;
+        vy[i] = -into * (into > BOUNCE_SPEED ? BOUNCE[ki] : 0);
+        vx[i] = liquid ? vx[i] * (1 - mu) : coulomb(vx[i], into, mu);
       } else if (y[i] < top) {
         y[i] = top;
-        vy[i] = Math.abs(vy[i]) * bouncy(vy[i]);
+        vy[i] = Math.abs(vy[i]) * (Math.abs(vy[i]) > BOUNCE_SPEED ? BOUNCE[ki] : 0);
       }
 
-      // Sleep, decided on where the grain is rather than how fast it is going.
-      if (++anchorTick[i] >= SLEEP_WINDOW) {
+      // Moved a radius from where it last told anyone: whatever was resting
+      // on it there has lost (some of) its support.
+      const hx = x[i] - homeX[i];
+      const hy = y[i] - homeY[i];
+      if (hx * hx + hy * hy > r2) {
+        this.markDirty(homeX[i], homeY[i], HOLDS[ki] === 1 ? DIRTY_SOLID : DIRTY_LIQUID);
+        homeX[i] = x[i];
+        homeY[i] = y[i];
+      }
+
+      // Probation: a grain woken to look again goes back to sleep at once if
+      // it has not fallen and is still held up.
+      const trial = this.probation[i];
+      if (trial !== 0) {
+        this.probation[i] = trial - 1;
+        if (trial === 1) {
+          const mx = x[i] - anchorX[i];
+          const my = y[i] - anchorY[i];
+          if (mx * mx + my * my < PROBATION_DRIFT * PROBATION_DRIFT) {
+            const held = this.heldBy(i);
+            if (held !== 0) {
+              asleep[i] = 1;
+              this.restOn[i] = (onBody[i] === 1 ? REST_BODY : 0) | (held === REST_WATER ? REST_WATER : 0);
+              vx[i] = 0;
+              vy[i] = 0;
+            }
+          }
+        }
+      }
+
+      // Sleep: stopped over a whole window, and held up by something.
+      if (asleep[i] === 0 && ++anchorTick[i] >= SLEEP_WINDOW) {
         anchorTick[i] = 0;
         const mx = x[i] - anchorX[i];
         const my = y[i] - anchorY[i];
         anchorX[i] = x[i];
         anchorY[i] = y[i];
 
-        if (mx * mx + my * my > SLEEP_DRIFT * SLEEP_DRIFT) {
+        if (mx * mx + my * my > SLEEP_DRIFT2[ki]) {
           quiet[i] = 0;
-        } else if (++quiet[i] >= material.sleepWindows) {
-          asleep[i] = 1;
-          vx[i] = 0;
-          vy[i] = 0;
+        } else if (++quiet[i] >= SLEEP_WINDOWS[ki] && !liquid) {
+          const held = this.heldBy(i);
+          if (held !== 0) {
+            asleep[i] = 1;
+            this.restOn[i] = (onBody[i] === 1 ? REST_BODY : 0) | (held === REST_WATER ? REST_WATER : 0);
+            vx[i] = 0;
+            vy[i] = 0;
+          }
         }
       }
 
-      awake++;
+      if (asleep[i] === 0) awake++;
+      touched[i] = 0;
+      onBody[i] = 0;
+      supX[i] = 0;
+      supY[i] = 0;
     }
 
     this.awake = awake;
+  }
+
+  /**
+   * Put still water to sleep, one body of it at a time.
+   *
+   * A drop never sleeps on its own. A pool is never perfectly still - the
+   * pressure solve leaves every drop wandering a little, and drops swap places
+   * inside a level pool without it changing at all - and a drop that does
+   * stop becomes a wall its awake neighbours jostle against, which knocks it
+   * awake again. Pools that slept drop by drop never slept. So the water is
+   * split into connected bodies (grid cells holding awake drops, touching),
+   * and a body sleeps whole once nearly every drop in it has been quiet for
+   * its windows. Waking stays local: a splash wakes the drops it reaches, and
+   * those can only spread until their body is all awake - which, once it is
+   * still again, is what passes this test.
+   */
+  private settleLiquid(): void {
+    const { cols, rows, cellLabel, cellStack, cellOf, kind, asleep, quiet, vx, vy } = this;
+    const n = this.count;
+    cellLabel.fill(0);
+    // Mark the cells with awake water: -1 is "water, not labelled yet".
+    let any = false;
+    for (let i = 0; i < n; i++) {
+      if (asleep[i] === 0 && LIQUID[kind[i]] === 1) {
+        cellLabel[cellOf[i]] = -1;
+        any = true;
+      }
+    }
+    if (!any) return;
+
+    // Label the touching cells: one flood fill per body of water.
+    let labels = 0;
+    for (let c = 0, cells = cols * rows; c < cells; c++) {
+      if (cellLabel[c] !== -1) continue;
+      const label = ++labels;
+      let top = 0;
+      cellStack[top++] = c;
+      cellLabel[c] = label;
+      while (top > 0) {
+        const cell = cellStack[--top];
+        const cy = (cell / cols) | 0;
+        const cx = cell - cy * cols;
+        for (let gy = cy > 0 ? cy - 1 : 0, gy1 = cy < rows - 1 ? cy + 1 : cy; gy <= gy1; gy++) {
+          for (let gx = cx > 0 ? cx - 1 : 0, gx1 = cx < cols - 1 ? cx + 1 : cx; gx <= gx1; gx++) {
+            const next = gy * cols + gx;
+            if (cellLabel[next] !== -1) continue;
+            cellLabel[next] = label;
+            cellStack[top++] = next;
+          }
+        }
+      }
+    }
+
+    // Tally each body, and settle the still ones.
+    const total = new Int32Array(labels + 1);
+    const still = new Int32Array(labels + 1);
+    for (let i = 0; i < n; i++) {
+      if (asleep[i] === 1 || LIQUID[kind[i]] === 0) continue;
+      const label = cellLabel[cellOf[i]];
+      total[label]++;
+      if (quiet[i] >= SLEEP_WINDOWS[kind[i]]) still[label]++;
+    }
+    let slept = 0;
+    for (let i = 0; i < n; i++) {
+      if (asleep[i] === 1 || LIQUID[kind[i]] === 0) continue;
+      const label = cellLabel[cellOf[i]];
+      if (still[label] < total[label] * POOL_STILL) continue;
+      asleep[i] = 1;
+      this.restOn[i] = 0;
+      vx[i] = 0;
+      vy[i] = 0;
+      this.homeX[i] = this.x[i];
+      this.homeY[i] = this.y[i];
+      slept++;
+    }
+    if (slept === 0) return;
+    this.awake -= slept;
+
+    // A body that has just been found still was only wandering: the cells its
+    // drops left dirty on the way are not support anything lost, and would
+    // wake it again on the very next step.
+    let kept = 0;
+    for (let d = 0; d < this.dirtyCount; d++) {
+      const cell = this.dirtyList[d];
+      const label = cellLabel[cell];
+      if (label > 0 && still[label] >= total[label] * POOL_STILL) this.dirty[cell] = 0;
+      else this.dirtyList[kept++] = cell;
+    }
+    this.dirtyCount = kept;
+  }
+
+  /**
+   * Is this grain held up, rather than merely slow? On the floor or on a body,
+   * or by contacts that can push it up between them.
+   *
+   * Each contact pushes the grain away from its neighbour, and friction lets
+   * that push lean by up to the friction angle either way. The grain is held
+   * if "up" is inside the fan those pushes make: one push within the friction
+   * angle of up, or two on either side of up less than half a turn apart -
+   * which covers sitting in a dip, being wedged between two neighbours or a
+   * neighbour and a side wall, and being jammed under an arch. A grain perched
+   * on the outside of a single neighbour is not held: it is still sliding off,
+   * however slowly, and must not be frozen there.
+   */
+  private cradled(i: number, onWater = false): boolean {
+    const r = this.options.radius;
+    if (this.y[i] >= this.height - r - 0.5 || this.onBody[i] === 1) return true;
+
+    const { x, y, kind, cols, rows, cellStart, order, cellOf } = this;
+    // A drop asks less: water in a pool rests on whatever is under it, and it
+    // only sleeps a body at a time, so the question for one drop is just
+    // whether the floor under it went away.
+    const liquid = LIQUID[this.kind[i]] === 1;
+    const lean = CRADLE_ANGLE[this.kind[i]];
+    // Drops sit further apart than grains near the top of a pool.
+    const reachD = liquid ? 2 * r + 3 : 2 * r + 0.75;
+    const reach2 = reachD * reachD;
+    const cell = cellOf[i];
+    const cy = (cell / cols) | 0;
+    const cx = cell - cy * cols;
+    // Angles of the pushes from straight up, positive to the right: the
+    // nearest one on each side. A side wall pushes level, inwards.
+    let right = x[i] <= r + 0.5 ? Math.PI / 2 : Infinity;
+    let left = x[i] >= this.width - r - 0.5 ? -Math.PI / 2 : -Infinity;
+
+    for (let gy = cy > 0 ? cy - 1 : 0, gy1 = Math.min(rows - 1, cy + 1); gy <= gy1; gy++) {
+      for (let gx = cx > 0 ? cx - 1 : 0, gx1 = Math.min(cols - 1, cx + 1); gx <= gx1; gx++) {
+        const c = gy * cols + gx;
+        for (let s = cellStart[c]; s < cellStart[c + 1]; s++) {
+          const j = order[s];
+          if (j === i) continue;
+          const dx = x[j] - x[i];
+          const dy = y[j] - y[i];
+          if (dx * dx + dy * dy > reach2) continue;
+          if (liquid) {
+            if (dy > 0) return true;
+            continue;
+          }
+          // Sand is not held up by water: it sinks through it - unless it is
+          // jammed there and has stopped, see `heldBy`.
+          if (HOLDS[kind[j]] === 0 && !onWater) continue;
+          // The push is (-dx, -dy); up is (0, -1).
+          const angle = Math.atan2(-dx, dy);
+          if (Math.abs(angle) <= lean) return true;
+          if (angle > 0) {
+            if (angle < right) right = angle;
+          } else if (angle > left) left = angle;
+        }
+      }
+    }
+    return right - left < Math.PI + 2 * lean;
+  }
+
+  /**
+   * What is holding a still grain up: 0 if nothing, 1 if sand, a body, a wall
+   * or the floor, `REST_WATER` if only water is. Sand sinks through water, so
+   * it is not held by it while it is still sinking - but a grain that sank
+   * onto drops pinned against the floor or other sand has stopped, and must be
+   * allowed to sleep, or it presses on them for ever and nothing in the pool
+   * sleeps either. It sleeps marked as resting on water, so any drop moving
+   * away from under it wakes it again (see `wakeDirty`).
+   */
+  private heldBy(i: number): number {
+    if (this.cradled(i)) return 1;
+    if (LIQUID[this.kind[i]] === 0 && this.cradled(i, true)) return REST_WATER;
+    return 0;
+  }
+
+  /** Is any body's bounding box within reach of this grain? The audit's test
+   *  for a grain that went to sleep on a body - a box, not a hull, because a
+   *  false "yes" only costs the grain one more look later. */
+  private nearBody(i: number): boolean {
+    const r = this.options.radius + 2;
+    const gx = this.x[i];
+    const gy = this.y[i];
+    for (let c = 0; c < this.colCount; c++) {
+      if (gx < this.colMinX[c] - r || gx > this.colMaxX[c] + r) continue;
+      if (gy < this.colMinY[c] - r || gy > this.colMaxY[c] + r) continue;
+      return true;
+    }
+    return false;
   }
 
   // --- rigid bodies -------------------------------------------------------
@@ -965,14 +1797,14 @@ export class GrainWorld {
             const i = order[k];
             if (i >= n) continue;
 
+            const gx = x[i];
+            const gy = y[i];
+            if (gx < minX || gx > maxX || gy < minY || gy > maxY) continue;
+
             if (asleep[i] === 1) {
               if (!wake) continue;
               this.wake(i);
             }
-
-            const gx = x[i];
-            const gy = y[i];
-            if (gx < minX || gx > maxX || gy < minY || gy > maxY) continue;
 
             this.collideGrain(c, i, gx, gy);
           }
@@ -1059,30 +1891,39 @@ export class GrainWorld {
     x[i] = gx + normalX * depth;
     y[i] = gy + normalY * depth;
     this.touched[i] = 1;
+    // A face under the grain (up to 60 degrees off level) is holding it up.
+    if (normalY < -0.5) this.onBody[i] = 1;
     this.supX[i] += normalX * depth;
     this.supY[i] += normalY * depth;
 
-    // Velocity: split the slip against the surface, reflect the normal part
-    // with restitution, kill a fraction of the tangent with friction, and add
-    // the surface's own drift (a belt) back on.
+    // Velocity, relative to the surface (the body's own motion plus a belt's
+    // drift): reflect the normal part with restitution, and take friction off
+    // the slip - Coulomb for a solid, so sand sticks to a ramp until it is too
+    // steep, a plain drag for a liquid.
     const beforeX = this.vx[i];
     const beforeY = this.vy[i];
-    const material = MATERIALS[this.kind[i]];
+    const ki = this.kind[i];
+    const mu = MU[ki];
     const svx = this.colVelX[c] + this.colSurfX[c];
     const svy = this.colVelY[c] + this.colSurfY[c];
     const rvx = this.vx[i] - svx;
     const rvy = this.vy[i] - svy;
     const into = rvx * normalX + rvy * normalY;
-    const out = into < 0 && -into > BOUNCE_SPEED ? -into * material.restitution : 0;
-    const keep = 1 - material.friction;
-    const tx = (rvx - into * normalX) * keep;
-    const ty = (rvy - into * normalY) * keep;
-    this.vx[i] = svx + tx + normalX * out;
-    this.vy[i] = svy + ty + normalY * out;
+    const hit = into < 0 ? -into : 0;
+    const out = hit > BOUNCE_SPEED ? hit * BOUNCE[ki] : 0;
+    const tx = -normalY;
+    const ty = normalX;
+    const slip = rvx * tx + rvy * ty;
+    const left = LIQUID[ki] === 1 ? slip * (1 - mu) : coulomb(slip, hit, mu);
+    // Whatever normal speed was not going in (separating) is kept.
+    const keepN = into < 0 ? out : into;
+    this.vx[i] = svx + tx * left + normalX * keepN;
+    this.vy[i] = svy + ty * left + normalY * keepN;
 
     const mass = this.colMass[c];
     if (mass === 0) return;
 
+    const material = MATERIALS[ki];
     this.contacts[c]++;
     this.grip[c] += material.grip;
 
@@ -1111,6 +1952,23 @@ export class GrainWorld {
       this.dragTorque[c] += (gx - this.colCx[c]) * dy - (gy - this.colCy[c]) * dx;
     }
   }
+}
+
+/** Density a drop has in a hexagonal pool at `spacing`, with the same kernel
+ *  `relaxLiquid` uses - the pressure is measured against this. */
+function restDensity(spacing: number, reach: number): number {
+  let rho = 0;
+  const rows = Math.ceil(reach / spacing) + 1;
+  for (let b = -rows; b <= rows; b++) {
+    for (let a = -rows * 2; a <= rows * 2; a++) {
+      if (a === 0 && b === 0) continue;
+      const dx = (a + b * 0.5) * spacing;
+      const dy = ((b * Math.sqrt(3)) / 2) * spacing;
+      const q = 1 - Math.hypot(dx, dy) / reach;
+      if (q > 0) rho += q * q;
+    }
+  }
+  return rho;
 }
 
 function growFloat(source: Float32Array<ArrayBuffer>, size: number): Float32Array<ArrayBuffer> {
