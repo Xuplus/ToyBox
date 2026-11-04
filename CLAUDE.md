@@ -1,7 +1,8 @@
 # CLAUDE.md — ToyBox
 
 Context for AI agents working in this repo. Keep this file short; see
-[`PLAN.md`](./PLAN.md) for the full design.
+[`PLAN.md`](./PLAN.md) for the full design and
+[`PERFORMANCE.md`](./PERFORMANCE.md) for the measured budget and the roadmap.
 
 ## What this is
 
@@ -55,6 +56,13 @@ bundle served by Caddy**, and the `/toybox` prefix is baked into the build via
   drawing.
 - `src/lib/` — `frame-meter.ts` (rolling window of frame durations → fps, p95,
   mean) and `color.ts` (shade/alpha). Pure, no DOM.
+- `src/physics/grains.ts` — the **granular layer prototype**: circles in
+  `Float32Array`s, counting-sort uniform grid, relaxation passes. No rotation,
+  so it is for balls only; 5–12× cheaper per body than Matter. Reached through
+  `?bench` (`__toybox.grains(n)`), not yet wired into the toy.
+- `src/engine/sprites.ts` — pre-rendered ball sprites. Drawing a ball from
+  gradients costs ~4× a blit; at a thousand balls that is a third of the frame.
+  Rebuilds when the device scale changes (`setScale`/DPR).
 - `src/debug.ts` — the `?bench=N` hook. Not part of the toy: see below.
 - `src/audio/` — `notes.ts` (scale + note naming, pure) and `synth.ts` (a tiny
   WebAudio synth — every sound is generated, no audio files).
@@ -70,7 +78,8 @@ npm run typecheck
 npm run test         # vitest — physics/, toys/, audio/, lib/ pure logic
 npm run build        # tsc --noEmit + vite build → ./dist
 npm run bench -- --url http://127.0.0.1:4173/ --sizes 0,500,1000
-                     # headless frame-rate measurement, see PLAN.md §9
+                     # headless frame-rate measurement, see PERFORMANCE.md
+npm run profile       # CPU profile: which function inside the step costs what
 ```
 
 Always run `npm run typecheck` and `npm run test` after changes.

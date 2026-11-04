@@ -1,7 +1,12 @@
 import type Matter from 'matter-js';
 import { alpha, shade } from '../lib/color';
+import type { GrainWorld } from '../physics/grains';
 import { metaOf } from '../toys/meta';
 import type { ToyMeta } from '../toys/types';
+import { ballSprite } from './sprites';
+
+/** Sand-coloured grains, so the granular layer reads as its own material. */
+const GRAIN_COLOR = '#e0a458';
 
 /** Translucent preview of the toy that is about to be dropped. */
 export interface Ghost {
@@ -25,6 +30,12 @@ export interface RenderInput {
   draggingId: number | null;
   /** world px per css px; hairlines are widened by it so they survive a zoom-out */
   scale: number;
+  /** device px per world px — sprites are rasterised at this density */
+  pixelRatio: number;
+  /** blit cached ball sprites instead of rebuilding gradients per body */
+  useSprites: boolean;
+  /** experimental granular layer, drawn behind the rigid bodies */
+  grains: GrainWorld | null;
 }
 
 export function renderScene(input: RenderInput): void {
@@ -32,12 +43,74 @@ export function renderScene(input: RenderInput): void {
 
   drawBackground(ctx, width, height, grid, scale);
 
-  for (const body of input.bodies) {
-    drawBody(ctx, body, input.time, body.id === input.draggingId);
+  if (input.grains) drawGrains(ctx, input.grains, input.pixelRatio);
+
+  if (input.useSprites) {
+    drawSprites(ctx, input.bodies, input.time, input.draggingId, input.pixelRatio);
+  } else {
+    for (const body of input.bodies) {
+      drawBody(ctx, body, input.time, body.id === input.draggingId);
+    }
   }
 
   if (input.ghost) drawGhost(ctx, input.ghost);
   drawFrame(ctx, width, height, scale);
+}
+
+/**
+ * The granular layer: one cached sprite, blitted `count` times. No path work,
+ * no gradients, no per-body state on the render side — that is the whole reason
+ * tens of thousands of grains are possible.
+ */
+function drawGrains(
+  ctx: CanvasRenderingContext2D,
+  world: GrainWorld,
+  pixelRatio: number,
+): void {
+  const { x, y, count } = world;
+  if (count === 0) return;
+
+  const sprite = ballSprite(GRAIN_COLOR, world.options.radius, pixelRatio);
+  const half = sprite.extent / 2;
+
+  for (let i = 0; i < count; i++) {
+    ctx.drawImage(sprite.canvas, x[i] - half, y[i] - half, sprite.extent, sprite.extent);
+  }
+}
+
+/**
+ * The fast path: circles are blitted from a cache, one drawImage each, with no
+ * save/restore and no allocation. Everything else (blocks, belts, note bars,
+ * shards, the body being dragged — which needs its glow) falls back to the
+ * vector renderer.
+ */
+function drawSprites(
+  ctx: CanvasRenderingContext2D,
+  bodies: Matter.Body[],
+  time: number,
+  draggingId: number | null,
+  pixelRatio: number,
+): void {
+  for (const body of bodies) {
+    const meta = metaOf(body);
+    if (!meta) continue;
+
+    if (meta.kind === 'ball' && body.id !== draggingId) {
+      const radius = body.circleRadius ?? meta.w / 2;
+      const sprite = ballSprite(meta.color, radius, pixelRatio);
+      const half = sprite.extent / 2;
+      ctx.drawImage(
+        sprite.canvas,
+        body.position.x - half,
+        body.position.y - half,
+        sprite.extent,
+        sprite.extent,
+      );
+      continue;
+    }
+
+    drawBody(ctx, body, time, body.id === draggingId);
+  }
 }
 
 /** Build the repeating grid path once per size change. */

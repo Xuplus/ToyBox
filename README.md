@@ -46,6 +46,12 @@ Six spouts take about a minute to fill the box that far. The numbers, the method
 and the caveats (headless has no vsync; measured at 1× pixel density) are in
 [`PLAN.md` §9](./PLAN.md#9-performance--measured-not-guessed).
 
+For the next order of magnitude — what to cache, which corner of the simulation
+to cut, and why "tens of thousands of rigid bodies at 60 Hz" is not a thing in
+a browser — see [`PERFORMANCE.md`](./PERFORMANCE.md). That file also covers the
+granular solver prototype in [`src/physics/grains.ts`](./src/physics/grains.ts),
+which simulates circles 5–12× cheaper than the rigid-body engine.
+
 ## Add a toy
 
 Edit [`src/toys/catalog.ts`](./src/toys/catalog.ts) — a toy is a palette entry

@@ -217,6 +217,11 @@ cap, a live FPS readout, and a playfield size control (1×–2.5×).
 
 ## 9. Performance — measured, not guessed
 
+> Deeper numbers — a CPU profile of where a step goes, the levers that were
+> measured (sleeping, solver iterations, sprite caching), and the roadmap to
+> tens of thousands of bodies — are in [`PERFORMANCE.md`](./PERFORMANCE.md).
+> The section below is the player-facing summary.
+
 Two things shipped for this: a live readout (bottom-left, "62 FPS · 431
 bodies") and a **playfield size** control in the header that zooms the world
 out — `2.5×` means two and a half times as wide *and* tall in the same space on

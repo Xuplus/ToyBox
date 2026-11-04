@@ -30,6 +30,28 @@ function estimate60(stats) {
   return Math.min(999, 1000 / Math.max(0.001, stepMs + stats.drawMs));
 }
 
+/** CPU profile -> self time per function, biggest first. */
+function summariseProfile(profile) {
+  const byId = new Map(profile.nodes.map((node) => [node.id, node]));
+  const self = new Map();
+  let total = 0;
+
+  for (let i = 0; i < profile.samples.length; i++) {
+    const node = byId.get(profile.samples[i]);
+    if (!node) continue;
+
+    const delta = profile.timeDeltas[i] ?? 0;
+    total += delta;
+
+    const name = node.callFrame.functionName || '(anonymous)';
+    const file = (node.callFrame.url || '').split('/').pop() || 'native';
+    const key = `${name}  ${file}`;
+    self.set(key, (self.get(key) ?? 0) + delta);
+  }
+
+  return { total, samples: profile.samples.length, rows: [...self].sort((a, b) => b[1] - a[1]) };
+}
+
 function parseArgs(argv) {
   const args = {};
   for (let i = 0; i < argv.length; i++) {
@@ -128,6 +150,20 @@ async function main() {
   const spawners = Number(args.spawners ?? 0);
   const seconds = Number(args.seconds ?? 40);
   const every = Number(args.every ?? 2000);
+  const fillId = args['fill-id'] ?? 'ballBouncy';
+  const grainSweep = args['grain-sweep'] === 'true';
+  const grainRadius = Number(args['grain-radius'] ?? 5);
+  const tuning = {};
+  if (args.sleeping === 'true') tuning.sleeping = true;
+  if (args['no-sprites'] === 'true') tuning.sprites = false;
+  if (args.iterations) {
+    const [position, velocity] = String(args.iterations).split(',').map(Number);
+    tuning.positionIterations = position;
+    if (Number.isFinite(velocity)) tuning.velocityIterations = velocity;
+  }
+  const tune = Object.keys(tuning).length > 0 ? tuning : null;
+  const profileSeconds = Number(args.profile ?? 0);
+  const tuneArg = tune ? `box.tune(${JSON.stringify(tune)});` : '';
 
   const profile = mkdtempSync(path.join(os.tmpdir(), 'toybox-bench-'));
   const launch = new URL(url);
@@ -167,7 +203,48 @@ async function main() {
 
     // Warm the JIT up on the empty page before measuring anything.
     await sleep(600);
-    if (spawners > 0) {
+
+    if (profileSeconds > 0) {
+      const count = sizes[0] ?? 1000;
+      await cdp.evaluate(
+        `(() => {
+           const box = window.__toybox;
+           box.clear();
+           box.scale(${scale});
+           ${tuneArg}
+           if (${count} > 0) {
+             ${grainSweep ? `box.grains(${count}, ${grainRadius});` : `box.fill(${count}, '${fillId}');`}
+           }
+           return box.tune;
+         })()`,
+      );
+
+      await sleep(warmup);
+      const tuning = await cdp.evaluate(
+        `(() => { const s = window.__toybox.tune({}); return s; })()`,
+      );
+      const stats = await cdp.evaluate('window.__toybox.stats()');
+      console.log(`sampling ${profileSeconds}s at ${stats.bodies} bodies`, JSON.stringify(tuning));
+
+      await cdp.request('Profiler.enable');
+      await cdp.request('Profiler.setSamplingInterval', { interval: 100 });
+      await cdp.request('Profiler.start');
+      await sleep(profileSeconds * 1000);
+      const { profile: cpuProfile } = await cdp.request('Profiler.stop');
+      await cdp.request('Profiler.disable');
+
+      const { total, samples, rows: hot } = summariseProfile(cpuProfile);
+      console.log('');
+      console.log(`${((total / 1000) | 0)} ms of samples (${samples}), self time:`.padEnd(56));
+      console.log('    ms     %   function');
+      console.log('------  ----  --------');
+      for (const [key, micros] of hot.slice(0, 22)) {
+        const share = (100 * micros) / Math.max(1, total);
+        console.log(
+          `${(micros / 1000).toFixed(1).padStart(6)}  ${share.toFixed(1).padStart(4)}  ${key}`,
+        );
+      }
+    } else if (spawners > 0) {
       // Park a row of spouts near the ceiling and watch the box fill up.
       const box = await cdp.evaluate(
         `(() => {
@@ -209,7 +286,10 @@ async function main() {
              const box = window.__toybox;
              box.clear();
              box.scale(${scale});
-             if (${size} > 0) box.fill(${size});
+             ${tuneArg}
+             if (${size} > 0) {
+               ${grainSweep ? `box.grains(${size}, ${grainRadius});` : `box.fill(${size}, '${fillId}');`}
+             }
              box.reset();
              return box.stats().bodies;
            })()`,
@@ -255,6 +335,8 @@ async function main() {
   }
 
   const pad = (value, width) => String(value).padStart(width);
+
+  if (profileSeconds > 0) return;
 
   if (spawners > 0) {
     console.log('');

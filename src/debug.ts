@@ -1,11 +1,11 @@
-import type { PerfStats, ToyBoxEngine } from './engine/ToyBoxEngine';
+import type { PerfStats, ToyBoxEngine, Tuning } from './engine/ToyBoxEngine';
 import type { ToyId } from './toys/types';
 
 /** Small surface for automated measurement. See `installBenchHook`. */
 export interface BenchApi {
   stats(): PerfStats;
   /** add `n` more balls without clearing */
-  fill(n: number): void;
+  fill(n: number, toyId?: ToyId): void;
   /** drop one toy at a world coordinate */
   place(id: ToyId, x: number, y: number): void;
   /** the simulated box size in world px */
@@ -15,6 +15,10 @@ export interface BenchApi {
   reset(): void;
   /** playfield multiplier, same values as the size control */
   scale(n: number): void;
+  /** quality/throughput knobs — sleeping, solver iterations, sprite renderer */
+  tune(options: Tuning): Tuning;
+  /** replace the box with `n` grains (the granular prototype) */
+  grains(n: number, radius?: number): number;
 }
 
 declare global {
@@ -46,11 +50,13 @@ export function installBenchHook(engine: ToyBoxEngine): void {
 
   window.__toybox = {
     stats: () => engine.stats(),
-    fill: (n: number) => engine.fill(n),
+    fill: (n: number, toyId?: ToyId) => engine.fill(n, toyId),
     place: (id: ToyId, x: number, y: number) => engine.placeToy(id, x, y),
     bounds: () => engine.bounds,
     clear: () => engine.clear(),
     reset: () => engine.resetStats(),
     scale: (n: number) => engine.setScale(n),
+    tune: (options: Tuning) => engine.tune(options),
+    grains: (n: number, radius?: number) => engine.spawnGrains(n, radius),
   };
 }

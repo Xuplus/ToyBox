@@ -2,6 +2,7 @@ import Matter from 'matter-js';
 import type { Synth } from '../audio/synth';
 import { FrameMeter } from '../lib/frame-meter';
 import { carryBodies } from '../physics/conveyor';
+import { GrainWorld, scatterGrains } from '../physics/grains';
 import { shardGrid, shardLayout } from '../physics/shatter';
 import { planEmissions } from '../physics/spawner';
 import { clampIntoBounds, createWorld, removeBody, resizeWorld, STEP_MS } from '../physics/world';
@@ -9,6 +10,7 @@ import { toyById } from '../toys/catalog';
 import { isShard, metaOf, setMeta } from '../toys/meta';
 import type { ToyDef, ToyId } from '../toys/types';
 import { buildGrid, renderScene, type Ghost } from './render';
+import { resetSprites } from './sprites';
 
 export type Tool = 'drag' | 'delete' | ToyId;
 
@@ -25,6 +27,14 @@ const NOTE_COOLDOWN = 70;
 const STAT_EVERY = 250;
 /** Playfield multipliers offered by the size control (world px per css px). */
 export const PLAYFIELD_SIZES = [1, 1.5, 2, 2.5] as const;
+
+/** Throughput knobs used by the benchmark harness. */
+export interface Tuning {
+  sleeping?: boolean;
+  positionIterations?: number;
+  velocityIterations?: number;
+  sprites?: boolean;
+}
 
 /** A snapshot of what the box is costing, pushed to the UI a few times a second. */
 export interface PerfStats {
@@ -87,6 +97,11 @@ export class ToyBoxEngine {
   private physicsMs = 0;
   private drawMs = 0;
   private statAcc = 0;
+  /** device px per world px, i.e. the canvas transform scale */
+  private pixelRatio = 1;
+  private sprites = true;
+  /** Experimental granular layer — see `physics/grains.ts` and `spawnGrains`. */
+  private grainWorld: GrainWorld | null = null;
 
   constructor(
     private readonly canvas: HTMLCanvasElement,
@@ -179,6 +194,11 @@ export class ToyBoxEngine {
     const k = dpr / this.scale;
     this.ctx.setTransform(k, 0, 0, k, 0, 0);
 
+    if (k !== this.pixelRatio) {
+      this.pixelRatio = k;
+      resetSprites(); // sprites are rasterised per device scale
+    }
+
     const worldW = Math.max(1, Math.round(w * this.scale));
     const worldH = Math.max(1, Math.round(h * this.scale));
     if (worldW === this.size.w && worldH === this.size.h) return;
@@ -206,8 +226,22 @@ export class ToyBoxEngine {
   clear(): void {
     this.endDrag();
     for (const body of [...this.bodies]) this.remove(body);
+    this.grainWorld = null;
     this.noteCounter = 0;
     this.emitCount();
+  }
+
+  /**
+   * Experimental: replace the box with `n` grains (see `physics/grains.ts`).
+   * This is the granular layer prototype — thousands of non-rotating circles
+   * for the cost of a few hundred Matter bodies. Gated behind `?bench`.
+   */
+  spawnGrains(n: number, radius = 5): number {
+    const world = new GrainWorld(Math.max(1, n), this.size.w, this.size.h, { radius });
+    const added = scatterGrains(world, n);
+    this.grainWorld = world;
+    this.emitCount();
+    return added;
   }
 
   /** Suppress the starter scene — a benchmark wants a known box. */
@@ -285,6 +319,7 @@ export class ToyBoxEngine {
     carryBodies(this.bodies);
     Matter.Engine.update(this.world.engine, STEP_MS);
     this.evictEscaped();
+    this.grainWorld?.step();
   }
 
   /**
@@ -468,11 +503,11 @@ export class ToyBoxEngine {
   }
 
   /**
-   * Benchmark helper, reachable only through `?bench=N`: lay `n` bouncy balls
-   * over the box in a loose grid. Not used by the toy itself.
+   * Benchmark helper, reachable only through `?bench=N`: lay `n` balls over the
+   * box in a loose grid. Not used by the toy itself.
    */
-  fill(n: number): void {
-    const toy = toyById('ballBouncy');
+  fill(n: number, toyId: ToyId = 'ballBouncy'): void {
+    const toy = toyById(toyId);
     if (!toy) return;
 
     const { w, h } = this.size;
@@ -505,7 +540,7 @@ export class ToyBoxEngine {
       frameMs: frame.frameMs,
       physicsMs: this.physicsMs,
       drawMs: this.drawMs,
-      bodies: this.bodies.length,
+      bodies: this.bodies.length + (this.grainWorld?.count ?? 0),
       toys,
     };
   }
@@ -516,9 +551,35 @@ export class ToyBoxEngine {
     this.statAcc = 0;
   }
 
+  /**
+   * Benchmark knobs, reachable only through `?bench` (see `src/debug.ts`).
+   * Everything here is a quality/throughput tradeoff worth measuring rather
+   * than a setting a player should meet.
+   */
+  tune(options: Tuning): Tuning {
+    const engine = this.world.engine;
+
+    if (options.sleeping !== undefined) engine.enableSleeping = options.sleeping;
+    if (options.positionIterations !== undefined) {
+      engine.positionIterations = options.positionIterations;
+    }
+    if (options.velocityIterations !== undefined) {
+      engine.velocityIterations = options.velocityIterations;
+    }
+    if (options.sprites !== undefined) this.sprites = options.sprites;
+
+    return {
+      sleeping: engine.enableSleeping,
+      positionIterations: engine.positionIterations,
+      velocityIterations: engine.velocityIterations,
+      sprites: this.sprites,
+    };
+  }
+
   private emitCount(): void {
-    const toys = this.bodies.filter((body) => !isShard(body)).length;
-    this.callbacks.onCount(toys, this.bodies.length);
+    const grains = this.grainWorld?.count ?? 0;
+    const toys = this.bodies.filter((body) => !isShard(body)).length + grains;
+    this.callbacks.onCount(toys, this.bodies.length + grains);
   }
 
   // --- input -------------------------------------------------------------
@@ -683,6 +744,9 @@ export class ToyBoxEngine {
       grid: this.grid,
       draggingId: this.drag?.body.id ?? null,
       scale: this.scale,
+      pixelRatio: this.pixelRatio,
+      useSprites: this.sprites,
+      grains: this.grainWorld,
     });
   }
 

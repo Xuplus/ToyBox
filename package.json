@@ -10,7 +10,8 @@
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "bench": "node scripts/bench.mjs"
+    "bench": "node scripts/bench.mjs",
+    "profile": "node scripts/bench.mjs --profile 4 --sizes 2000"
   },
   "dependencies": {
     "matter-js": "^0.20.0",
