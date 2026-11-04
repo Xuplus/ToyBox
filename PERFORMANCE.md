@@ -245,30 +245,54 @@ tests in `grains.test.ts`.
 Grains are pushed out of every rigid body, which on its own makes a body an
 irresistible force - a ball ploughs through a dune as if it were not there,
 because a grain is 1/700 of a body's mass and can take no momentum from it.
-So each contact also records the momentum the *body* gave up (the grain's
-velocity change), and the engine applies it back as a force:
 
-- `GRAIN_FORCE` (weight) is the static half: a pile resting on a crate weighs
-  on it, off-centre piles tip it.
-- `GRAIN_DRAG` (momentum) is the dynamic half: every grain the body displaces
-  takes velocity away from it. `DRAG_GAIN` is set well above the physical mass
-  ratio, because what stops a ball in sand is not the one grain it touches but
-  the whole jammed pile behind it.
+The first attempt at a fix recorded the momentum the body gave up (the grain's
+velocity change) and re-applied it as a **force** on the next step, with a gain
+(300) far above the physical mass ratio to stand in for the jammed pile behind
+each grain. It looked right in a screenshot and it was unstable, because a force
+that keeps pushing after the body has stopped is a spring - and a spring strong
+enough to stop a cannonball is strong enough to throw it back out. Measured with
+the probe in `scripts/scenes/shake.js`, **a heavy ball dropped on a settled sand
+bed came back up at 10 px/step; in a deep pile the same coupling launched it at
+700 px/step.** That is the shaking: not noise, an oscillator.
 
-The measured result: a cannonball dropped on a sand cone now comes to rest in
-the crater it makes, and rolls down the slope when it lands off-centre.
+The coupling is now a **contact constraint**, not a force:
+
+- `supportImpulse` (`grains.ts`) takes speed *out of* the body along the contact
+  normal - at most the speed it has, so it can never reverse it - and cancels the
+  one step of gravity the medium is carrying. A body at rest stays at rest; a
+  body arriving fast is slowed over a few steps and carves a crater.
+- The take is a fraction of the incoming speed set by `grip` per contact
+  (sand 0.05, water 0.012), with a floor of one gravity step so a supported body
+  actually stops instead of sinking a gravity step at a time.
+- `dragImpulse` does the same for a medium that cannot hold anything up, so water
+  only ever slows a body and never lifts it.
+- The support normal is the sum of the contacts that push the body **up**. The
+  full sum is the weight a pile leaves on a crate (kept, it tips things), but
+  when a body is buried the two cancel exactly and it would sink for ever - there
+  is no pressure gradient to favour the grains underneath.
+
+Measured, ball r=18 over a settled bed, `scripts/scenes/shake.js`:
+
+| | old force coupling | contact constraint |
+|---|---:|---:|
+| ball thrown back up | 9.96 px/step (shallow), 702 (deep) | **0.06 px/step** |
+| direction reversals | 3+ | **0** |
+| rest after impact | never | 0.9 s |
+| pile still awake, 5 s later | 1 226 of 2 210 | 579 of 6 000 |
 
 ### Sand and water are not the same material
 
-| | friction | cohesion | rolling | restitution |
-|---|---:|---:|---:|---:|
-| sand | 0.22 | 0 | 0.90 | 0.10 |
-| water | 0.01 | 0.12 | 1.00 | 0.02 |
+| | friction | cohesion | rolling | restitution | support | grip |
+|---|---:|---:|---:|---:|---:|---:|
+| sand | 0.22 | 0 | 0.90 | 0.10 | 1 | 0.05 |
+| water | 0.01 | 0.12 | 1.00 | 0.02 | 0 | 0.012 |
 
-Sand holds an angle of repose and stops rolling; water has almost no friction,
-enough cohesion to hold a surface, and no rolling resistance at all, so it
-runs, spreads and levels. The two are visibly different materials in the box -
-a cone and a puddle - and that difference is entirely in that table.
+Sand holds an angle of repose, stops rolling and holds a body up; water has
+almost no friction, enough cohesion to hold a surface, no rolling resistance and
+no support at all, so it runs, spreads and levels - and a ball dropped into it
+sinks through to the floor instead of resting on top. The two are visibly,
+measurably different materials, and the difference is that table.
 
 ### What it gives up, and why that is the right trade
 
@@ -277,11 +301,39 @@ a cone and a puddle - and that difference is entirely in that table.
 - **Stacking of shapes.** A grain pile is held up by contacts, not by a solver
   that understands torque, so a stack of grains is a heap and not a tower. That
   is exactly what sand does.
-- **Water is not a fluid.** It runs, spreads and levels, and with the liquid
-  shading it reads as a body of water - but there is no pressure field, no
-  buoyancy and no floating. It is a pile of very slippery, slightly sticky
-  circles that happens to look like a puddle. A real SPH/PBF solver is a
-  different project.
+- **Pressure.** There is no density constraint and no pressure field, so the
+  medium cannot *bear* a load: it can stop a body by removing its speed, but a
+  body that is buried is supported only by the grains that happen to be under it,
+  and a heavy one creeps down through a deep bed at ~2 px/s. Water cannot push
+  back at all, so it has no buoyancy: a cannonball sinks and a beach ball sinks
+  too. Both are the same missing ingredient.
+
+### What a pressure solver would cost - prototype, measured
+
+The missing ingredient is a density constraint. The standard 2D implementation
+(Position Based Fluids, Macklin & Müller 2013) is close to what is already here:
+the same uniform grid, the same typed arrays, but every particle gets a
+constraint multiplier `lambda` from its neighbourhood density, and the position
+correction is driven by `lambda_i + lambda_j` instead of by overlap. Prototyped
+in isolation (~200 lines, Node, same V8), 952 particles in a 600×400 box:
+
+| | ms/step |
+|---|---:|
+| 3 PBF iterations | 1.30 |
+| 3 iterations + XSPH viscosity | 2.34 |
+
+and it does what the current solver cannot:
+
+- a perfect lattice holds its rest density to **1.000** and does not drift at all;
+- a dam break levels: surface height spread across 60 columns went from **129 px
+  at 0.5 s to 8.4 px at 10 s**, with the last particles below 1.7 px/step;
+- a rigid body inside the fluid feels the pressure directly, which is buoyancy -
+  no gain constant, no drag model, nothing to tune.
+
+At ~2.4 µs per particle (3 iterations + viscosity) 2,000 water particles is
+**~4.8 ms** of a 16.7 ms frame; 2,000 is also about what a 12,000-grain budget
+should spend on water, with sand on the cheaper path. Two iterations and a
+half-stencil pair walk should roughly halve that.
 
 ---
 
@@ -425,6 +477,7 @@ L ≈ a week+.
 | 6 | Worker + `SharedArrayBuffer` + interpolation | M | +16.7 ms budget, no jank | todo |
 | 7 | Own SoA rigid solver (convex polys + circles + joints) | L | 3–5× over matter on rigid | not started |
 | 8 | ~~Rapier2D port~~ | — | **ruled out by measurement** | — |
+| 9 | **Density constraint (PBF) for sand and water** | M | pressure: buoyancy, bearing capacity, water that levels | prototype measured, see §6 |
 
 Notes:
 

@@ -73,8 +73,9 @@ bundle served by Caddy**, and the `/toybox` prefix is baked into the build via
   9, and a settled pile sleeps, so it is cheaper again once it stops.
   `MATERIALS` at the top of the file is the only description of what each
   material is: colour, alpha, rim, friction, restitution, cohesion, rolling
-  resistance, whether it is drawn as a liquid, and how it sleeps. Both painters
-  read it, so a new material is one entry.
+  resistance, whether it can hold a body up (`support`) and how hard it takes a
+  body's speed away (`grip`), whether it is drawn as a liquid, and how it sleeps.
+  Both painters read it, so a new material is one entry.
 - `src/engine/sprites.ts` — pre-rendered ball sprites, **canvas 2D path only**.
   Drawing a ball from gradients costs ~4× a blit; at a thousand balls that is a
   third of the frame. The WebGL path shades circles in a fragment shader and
@@ -163,12 +164,19 @@ Always run `npm run typecheck` and `npm run test` after changes.
   a flat layer of grains ever stops: 0.9 for sand, and 1 (none) for water. It
   applies only to contacted grains slower than `ROLL_SPEED`, so a falling stream
   is unaffected.
-- **The coupling is two-way.** `loadFx/loadFy/loadTorque` carry the weight of
-  the pile into a body (`GRAIN_FORCE`), and `dragX/dragY/dragTorque` carry the
-  momentum it gave up pushing grains around (`GRAIN_DRAG`). Remove either and a
-  ball is either weightless to the sand or an irresistible force through it.
-  `DRAG_GAIN` is deliberately far above the physical mass ratio: what resists a
-  ball is the jammed pile behind each grain, not one grain's mass.
+- **The coupling is a constraint, never a force.** `supportImpulse` and
+  `dragImpulse` in `grains.ts` take speed *out of* a body along the contact
+  normal and may carry its weight; they may never add speed. `holdFx/holdFy` is
+  the part of the load that points up (what the body stands on), `loadF` is the
+  full sum (the weight a pile leaves on a crate), and `grip` is how hard the
+  medium can take a body's speed away, per contact. The old design re-applied the
+  grain's momentum change as a force on the next step with a gain of 300; it
+  looked fine in a screenshot and it was a delayed spring, which is why a dune
+  used to throw a ball back out. Do not reintroduce a force here.
+- **Buried bodies need the upward contacts only.** Without a pressure field, a
+  body one radius into a pile has as many contacts above it as below, so the net
+  sum is zero and it sinks for ever. `holdF` keeps just the ones pushing it up.
+  A real fix is a density constraint, not a bigger sum - see `PLAN.md §10`.
 - **A liquid is drawn, not simulated.** `liquid` in `MATERIALS` switches the dot
   pipeline to a flat fill with a feathered edge and no specular (`aLiquid` in
   `shaders.ts`), which is what makes a cluster read as one body of water. The

@@ -50,6 +50,15 @@ export interface GrainMaterialSpec {
   /** true for a true liquid: flat translucent fill and a feathered edge, so a
    *  cluster reads as one body of water instead of a heap of blue beads */
   liquid: boolean;
+  /** 1 when the medium can hold a body up, 0 when it cannot. Sand stands under
+   *  a ball; water does not, and without buoyancy a "support" from water would
+   *  be a lie. This also weights the static load the pile leaves on a body. */
+  support: number;
+  /** fraction of the speed into the medium one contact takes out per step. It
+   *  is the same idea as `friction`, but applied to a rigid body rather than
+   *  between two grains, and it is what stops a ball dead in sand and lets it
+   *  sink through water. */
+  grip: number;
   /** fraction of the speed a slow, contacted grain keeps per step. Perfect
    *  circles roll for ever on a flat floor; real sand is angular and stops,
    *  and water does not stop at all. */
@@ -70,6 +79,8 @@ export const MATERIALS: readonly GrainMaterialSpec[] = [
     restitution: 0.1,
     cohesion: 0,
     liquid: false,
+    support: 1,
+    grip: 0.05,
     rolling: 0.9,
     sleepWindows: 1,
   },
@@ -83,6 +94,8 @@ export const MATERIALS: readonly GrainMaterialSpec[] = [
     restitution: 0.02,
     cohesion: 0.12,
     liquid: true,
+    support: 0,
+    grip: 0.012,
     rolling: 1,
     sleepWindows: 2,
   },
@@ -145,18 +158,99 @@ const GRAINS_PER_MASS = 700;
 export const GRAIN_FORCE = GRAVITY_SCALE / GRAINS_PER_MASS;
 
 /**
- * The force a body feels for every px/step of velocity it takes away from a
- * grain it pushed.
- *
- * This is the other half of the coupling, and it is what makes sand *resist*.
- * A grain weighs 1/700 of a body, so the momentum it can take on its own is
- * nothing - a ball would plough through a dune without slowing. What actually
- * stops it is that the grain it pushes cannot go anywhere: it is jammed
- * against the pile behind it. `DRAG_GAIN` is that jamming, expressed as "how
- * many grains' worth of momentum does one displaced grain cost the body".
+ * The least a contact takes out of a body's speed per step: a little more than
+ * one step of gravity, so a supported body comes to rest instead of sinking one
+ * gravity step per step for ever.
  */
-const DRAG_GAIN = 300;
-export const GRAIN_DRAG = (GRAIN_FORCE / GRAVITY_ACCEL) * DRAG_GAIN;
+const SUPPORT_FLOOR = GRAVITY_ACCEL * 1.25;
+
+/**
+ * What one step of contact does to a body.
+ *
+ * `vx/vy` is its new velocity; `fx/fy` is a force to add so the medium carries
+ * the body's weight - Matter applies gravity to the next step, and a supported
+ * body must not have its gravity applied again.
+ */
+export interface ContactImpulse {
+  vx: number;
+  vy: number;
+  fx: number;
+  fy: number;
+}
+
+const NO_FORCE = { fx: 0, fy: 0 };
+
+/**
+ * What a pile does to a body it is holding up.
+ *
+ * `loadX/loadY` is the sum of the contact normals the medium pushes with: its
+ * direction is what the body is sitting on, its length is the number of
+ * contacts. `grip` is the sum of every contact's `grip` material property.
+ *
+ * The medium may take away speed that is going *into* it, and it may carry the
+ * body's weight. It may never add speed. That one rule is the difference
+ * between a ball that lands and stops and the trampoline that the old
+ * force-based drag turned a dune into: a force that keeps pushing after the
+ * ball has stopped is a spring, and a spring with a gain high enough to stop a
+ * ball is a spring that throws it back out.
+ *
+ * The take is a *fraction of the speed coming in*, not a fixed force, so a fast
+ * body keeps going for a few steps and carves a crater, while a body that is
+ * nearly at rest has its one gravity step removed. Both cases end at zero, and
+ * neither can overshoot.
+ */
+export function supportImpulse(
+  loadX: number,
+  loadY: number,
+  grip: number,
+  vx: number,
+  vy: number,
+  mass: number,
+): ContactImpulse {
+  const len = Math.hypot(loadX, loadY);
+  if (len < 1e-6 || grip <= 0) return { vx, vy, ...NO_FORCE };
+
+  const nx = loadX / len;
+  const ny = loadY / len;
+  const into = vx * nx + vy * ny;
+
+  let outVx = vx;
+  let outVy = vy;
+  if (into < 0) {
+    const take = Math.min(-into, Math.max(SUPPORT_FLOOR, -into * Math.min(1, grip)));
+    outVx += nx * take;
+    outVy += ny * take;
+  }
+
+  // The weight the pile carries, along its normal. Never more than the body's
+  // own weight: a support only takes away gravity, it cannot supply lift.
+  const carry = ny < 0 ? -mass * GRAVITY_SCALE * ny : 0;
+  return { vx: outVx, vy: outVy, fx: nx * carry, fy: ny * carry };
+}
+
+/**
+ * What a medium that cannot hold a body up (water) does to one moving through
+ * it: it slows it down. `dragX/dragY` is the momentum the grains took, so it
+ * points the way the body is losing speed - the direction to take it from.
+ */
+export function dragImpulse(
+  dragX: number,
+  dragY: number,
+  grip: number,
+  vx: number,
+  vy: number,
+): { vx: number; vy: number } {
+  const len = Math.hypot(dragX, dragY);
+  if (len < 1e-6 || grip <= 0) return { vx, vy };
+
+  const nx = dragX / len;
+  const ny = dragY / len;
+  const into = vx * nx + vy * ny;
+  if (into >= 0) return { vx, vy };
+
+  const take = Math.min(-into, -into * Math.min(1, grip));
+  return { vx: vx + nx * take, vy: vy + ny * take };
+}
 
 /** Colliders are capped so a shatter storm can't turn the grain pass quadratic. */
 const MAX_COLLIDERS = 512;
@@ -236,6 +330,25 @@ export class GrainWorld {
   readonly loadFx = new Float32Array(MAX_COLLIDERS);
   readonly loadFy = new Float32Array(MAX_COLLIDERS);
   readonly loadTorque = new Float32Array(MAX_COLLIDERS);
+  /**
+   * The part of the load that points *up*: the contacts a body is standing on,
+   * kept apart from the ones pressing on it from above.
+   *
+   * Without a pressure field the two cancel exactly when a body is buried, and
+   * a ball that has sunk one radius into a dune is then surrounded by as many
+   * contacts as it has below it - so the net load is nothing and it keeps
+   * sinking. Only counting what it stands on is what lets it come to rest at
+   * any depth. `loadF` stays the full sum: that one is the weight a pile leaves
+   * on a crate.
+   */
+  readonly holdFx = new Float32Array(MAX_COLLIDERS);
+  readonly holdFy = new Float32Array(MAX_COLLIDERS);
+  /** how many grains are touching the collider - what makes a deep contact
+   *  hold harder than a graze */
+  readonly contacts = new Uint16Array(MAX_COLLIDERS);
+  /** sum of the contact materials' `grip`, so the engine knows how hard the
+   *  medium can take a body's speed away */
+  readonly grip = new Float32Array(MAX_COLLIDERS);
   /** per-collider accumulated momentum taken from the body by the grains it
    *  pushed, in px/step of grain velocity */
   readonly dragX = new Float32Array(MAX_COLLIDERS);
@@ -732,6 +845,10 @@ export class GrainWorld {
       this.loadFx[c] = 0;
       this.loadFy[c] = 0;
       this.loadTorque[c] = 0;
+      this.holdFx[c] = 0;
+      this.holdFy[c] = 0;
+      this.contacts[c] = 0;
+      this.grip[c] = 0;
       this.dragX[c] = 0;
       this.dragY[c] = 0;
       this.dragTorque[c] = 0;
@@ -966,13 +1083,23 @@ export class GrainWorld {
     const mass = this.colMass[c];
     if (mass === 0) return;
 
+    this.contacts[c]++;
+    this.grip[c] += material.grip;
+
     // The load is the opposite of the outward normal: the grain pushes *into*
-    // the body. The engine scales it by `GRAIN_FORCE`.
-    const fx = -normalX;
-    const fy = -normalY;
+    // the body. Weighted by `support`, so sand can carry a body and water
+    // leaves no load behind it - there is no buoyancy to model.
+    const fx = -normalX * material.support;
+    const fy = -normalY * material.support;
     this.loadFx[c] += fx;
     this.loadFy[c] += fy;
     this.loadTorque[c] += (gx - this.colCx[c]) * fy - (gy - this.colCy[c]) * fx;
+
+    // What the body is standing on: only the contacts that push it up.
+    if (fy < 0) {
+      this.holdFx[c] += fx;
+      this.holdFy[c] += fy;
+    }
 
     // Momentum: whatever the grain lost, the body gained. This is what makes a
     // ball sink into sand instead of falling through it as if it were not there.

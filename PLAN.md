@@ -293,3 +293,63 @@ Which is the practical answer: **drop four to six spouts in and you get about a
 minute of smooth play, then the readout goes from green to amber to red over the
 next twenty seconds.** The body cap (2000) is what stops it there; clearing is
 one click.
+
+---
+
+## 10. Sand and water — what "good" would take
+
+The granular layer is a **position relaxation**, not a fluid or a soil model. It
+has no notion of pressure, so it can only do two things: keep grains from
+overlapping, and let a body push them around. Everything the toy does with sand
+and water follows from that, including what looks wrong:
+
+| symptom | cause |
+|---|---|
+| a ball dropped on a pile shook the pile, then bounced out of it | the coupling was a force applied a step late; measured 10 px/step back out of a shallow pile, 702 out of a deep one |
+| the ball then sank slowly through sand (2 px/s) | the medium has no bearing capacity: only the grains physically under it push back |
+| sand and water both hold a heap; water does not level | no pressure, so a column of water has nothing pushing it sideways |
+| nothing floats | buoyancy *is* the pressure gradient |
+
+### The plan
+
+**P0 (shipped)** - the coupling is a contact constraint. It can take speed away
+from a body and carry its weight; it can never add speed. 10 px/step of bounce
+became 0.06, and a pile that stayed awake for ever now settles.
+
+**P1 - a density constraint (PBF, and XPBD for the contacts).** This is the single change that buys
+pressure, and pressure is all four symptoms above. Each particle accumulates the
+density of its neighbourhood and a constraint multiplier from it; the position
+correction comes from the *pressure* of the pair instead of from the overlap.
+Prototyped at 952 particles: 2.3 ms/step with viscosity, a lattice that holds its
+rest density exactly, and a dam break that levels from a 129 px surface spread to
+8 px. Buoyancy then comes out of the same correction - no extra model.
+
+**P2 - sand as a frictional, yielding medium.** The same solver, plus
+(a) Coulomb friction on the tangential correction, limited by `mu` times the
+normal correction, and (b) a yield threshold: only correct once the compression
+exceeds a strain, which is what lets a pile stand at an angle of repose and then
+collapse when it is overloaded or dug into. That replaces `rolling` (a global
+speed clamp) with real shear strength.
+
+**P3 - water as a surface, not a heap of discs.** The liquid draw path already
+fuses overlapping drops, but a dense pool still shows the lattice as texture, and
+poured water can still stand in a cone. With pressure in place, a puddle levels
+by itself; the draw path can then be a single surface (a metaball/marching-squares
+outline) instead of thousands of discs.
+
+**P4 - cost control.** 2,000 particles at 2.4 µs is 4.8 ms; two iterations, a
+half-stencil pair walk and sleeping the settled interior should bring the
+common case to ~2 ms, which is where water can be a toy rather than a stunt.
+
+### What this costs
+
+- **Speed.** A density constraint is two neighbour passes per iteration instead
+  of one - measured 1.3–2.3 ms per 1,000 particles against 0.5 ms today. Water
+  and sand stop being free; the budget becomes "about 2,000 moving particles".
+- **Reach.** The solver has to become substep-based (2–4 substeps per 60 Hz tick)
+  for the constraint to be stiff without jitter. That is a rewrite of `step()`,
+  not a patch to it.
+- **Risk.** Everything that depends on the current sleep and contact rules -
+  conveyors carrying sand, the delete tool, the pour stream - has to be re-pinned
+  with tests. That is why P0 was done as a separate, shippable step.
+

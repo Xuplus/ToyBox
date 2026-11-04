@@ -6,7 +6,7 @@
 //
 // Same body positions, same time of day, both renderers. See PERFORMANCE.md.
 
-(() => {
+(async () => {
   const box = window.__toybox;
   box.clear();
 
@@ -42,5 +42,7 @@
     }),
   );
 
+  // Let it fall: a screenshot 400 ms in catches everything still in the air.
+  await new Promise((resolve) => setTimeout(resolve, 4000));
   return box.stats();
 })()

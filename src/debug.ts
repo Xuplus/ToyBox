@@ -20,6 +20,8 @@ export interface BenchApi {
   tune(options: Tuning): Tuning;
   /** replace the box with `n` grains of one material */
   grains(n: number, radius?: number, kind?: GrainMaterial): number;
+  /** where every body is, so a scene can report what actually happened */
+  probe(): { x: number; y: number; vx: number; vy: number; w: number }[];
   /** select a tool, as the palette would - for reproducible screenshots */
   tool(id: Tool): void;
 }
@@ -62,6 +64,7 @@ export function installBenchHook(engine: ToyBoxEngine): void {
     tune: (options: Tuning) => engine.tune(options),
     grains: (n: number, radius?: number, kind?: GrainMaterial) =>
       engine.spawnGrains(n, radius, kind),
+    probe: () => engine.probe(),
     tool: (id: Tool) => engine.setTool(id),
   };
 }

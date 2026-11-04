@@ -3,11 +3,12 @@ import type { Synth } from '../audio/synth';
 import { FrameMeter } from '../lib/frame-meter';
 import { carryBodies } from '../physics/conveyor';
 import {
+  dragImpulse,
   GRAIN,
-  GRAIN_DRAG,
   GRAIN_FORCE,
   GrainWorld,
   scatterGrains,
+  supportImpulse,
   type GrainCollider,
   type GrainMaterial,
 } from '../physics/grains';
@@ -365,11 +366,13 @@ export class ToyBoxEngine {
   // --- granular layer ----------------------------------------------------
 
   /**
-   * One grain step, then hand the bodies back the weight that rested on them.
+   * One grain step, then hand the bodies back what the pile did to them.
    *
-   * Matter clears `force`/`torque` at the end of every update, so this load is
-   * integrated on the *next* step - a 16 ms delay that nothing can see, in
-   * exchange for not having to run the grain solver inside Matter's step.
+   * Matter clears `force`/`torque` at the end of every update, so the load is
+   * integrated on the *next* step - a 16 ms delay that nothing can see. The
+   * velocity changes are applied straight to the body, because an impulse that
+   * arrives a step late is a spring with a delay in it, and that is what used
+   * to make a dune throw a ball back out.
    */
   private stepGrains(): void {
     const grains = this.grainWorld;
@@ -379,28 +382,43 @@ export class ToyBoxEngine {
     grains.step(this.colliderView);
 
     const load = GRAIN_FORCE;
-    const drag = GRAIN_DRAG;
     for (let i = 0; i < this.colliderView.length; i++) {
       const body = this.colliderView[i].body;
       if (body.isStatic) continue;
 
       const fx = grains.loadFx[i];
       const fy = grains.loadFy[i];
-      const torque = grains.loadTorque[i];
-      if (fx !== 0 || fy !== 0 || torque !== 0) {
-        body.force.x += fx * load;
-        body.force.y += fy * load;
-        body.torque += torque * load;
+      const grip = grains.grip[i];
+
+      // Sand: holds the body up on what it is standing on, and stops it from
+      // sinking through. Water leaves no hold, so it only ever gets drag.
+      const hold = supportImpulse(
+        grains.holdFx[i],
+        grains.holdFy[i],
+        grip,
+        body.velocity.x,
+        body.velocity.y,
+        body.mass,
+      );
+      // Water: no support, only drag.
+      const wet = dragImpulse(grains.dragX[i], grains.dragY[i], grip, hold.vx, hold.vy);
+
+      if (wet.vx !== body.velocity.x || wet.vy !== body.velocity.y) {
+        Matter.Body.setVelocity(body, { x: wet.vx, y: wet.vy });
       }
 
-      // The grains the body pushed, pushing back: this is the sand's resistance.
-      const dx = grains.dragX[i];
-      const dy = grains.dragY[i];
+      if (fx !== 0 || fy !== 0) {
+        body.force.x += fx * load + hold.fx;
+        body.force.y += fy * load + hold.fy;
+        body.torque += grains.loadTorque[i] * load;
+      }
+
+      // A body grinding through the medium loses its spin the same way it
+      // loses its speed - never more than the spin it has.
       const spin = grains.dragTorque[i];
-      if (dx !== 0 || dy !== 0 || spin !== 0) {
-        body.force.x += dx * drag;
-        body.force.y += dy * drag;
-        body.torque += spin * drag;
+      if (spin !== 0 && grip > 0) {
+        const damp = Math.min(1, grip) * 0.5;
+        Matter.Body.setAngularVelocity(body, body.angularVelocity * (1 - damp));
       }
     }
   }
@@ -726,6 +744,26 @@ export class ToyBoxEngine {
       grainsAwake: grains?.awake ?? 0,
       renderer: this.painter.kind,
     };
+  }
+
+  /**
+   * Where every body is, for measuring a scene rather than looking at it - a
+   * dropped ball that bounces shows up as a velocity that changes sign, and a
+   * pile that will not settle shows up as a box that keeps moving.
+   */
+  probe(): { x: number; y: number; vx: number; vy: number; w: number }[] {
+    const out: { x: number; y: number; vx: number; vy: number; w: number }[] = [];
+    for (const body of this.bodies) {
+      if (body.isStatic) continue;
+      out.push({
+        x: body.position.x,
+        y: body.position.y,
+        vx: body.velocity.x,
+        vy: body.velocity.y,
+        w: body.angularVelocity,
+      });
+    }
+    return out;
   }
 
   /** Forget the timing window - call before measuring. */
