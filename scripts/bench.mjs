@@ -145,6 +145,8 @@ async function main() {
   const warmup = Number(args.warmup ?? 2500);
   const sample = Number(args.sample ?? 3000);
   const port = Number(args.port ?? 9333);
+  // HiDPI roughly doubles the fill cost, so it is worth measuring separately.
+  const dpr = Number(args.dpr ?? 1);
   const browserPath = findBrowser(args.browser);
   const headed = args.headed === 'true';
   const spawners = Number(args.spawners ?? 0);
@@ -172,7 +174,7 @@ async function main() {
   launch.searchParams.set('bench', '0');
 
   console.log(`browser  ${browserPath}`);
-  console.log(`page     ${url}  (playfield ${scale}×)`);
+  console.log(`page     ${url}  (playfield ${scale}×, dpr ${dpr})`);
   console.log('');
 
   const browser = spawn(
@@ -191,7 +193,7 @@ async function main() {
       // Headless has no GPU; without this Chrome refuses the SwiftShader
       // fallback and the WebGL renderer never comes up.
       '--enable-unsafe-swiftshader',
-      '--force-device-scale-factor=1',
+      `--force-device-scale-factor=${dpr}`,
       '--window-size=1440,900',
       launch.toString(),
     ],
