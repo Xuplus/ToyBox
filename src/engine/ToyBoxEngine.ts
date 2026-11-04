@@ -9,8 +9,8 @@ import { clampIntoBounds, createWorld, removeBody, resizeWorld, STEP_MS } from '
 import { toyById } from '../toys/catalog';
 import { isShard, metaOf, setMeta } from '../toys/meta';
 import type { ToyDef, ToyId } from '../toys/types';
-import { buildGrid, renderScene, type Ghost } from './render';
-import { resetSprites } from './sprites';
+import { createPainter } from './painter';
+import type { Ghost, Painter, Scene } from './scene';
 
 export type Tool = 'drag' | 'delete' | ToyId;
 
@@ -50,6 +50,8 @@ export interface PerfStats {
   drawMs: number;
   bodies: number;
   toys: number;
+  /** which painter is running — `webgl` unless the browser refused one */
+  renderer: Painter['kind'];
 }
 
 export interface EngineCallbacks {
@@ -70,7 +72,7 @@ interface DragState {
 }
 
 export class ToyBoxEngine {
-  private readonly ctx: CanvasRenderingContext2D;
+  private readonly painter: Painter;
   private world = createWorld(1, 1);
   private bodies: Matter.Body[] = [];
   private tool: Tool = 'drag';
@@ -85,7 +87,6 @@ export class ToyBoxEngine {
   private scale = 1;
   /** simulated box size, `view * scale` */
   private size = { w: 1, h: 1 };
-  private grid: Path2D | null = null;
   private time = 0;
   private last = 0;
   private acc = 0;
@@ -108,9 +109,7 @@ export class ToyBoxEngine {
     private readonly synth: Synth,
     private readonly callbacks: EngineCallbacks,
   ) {
-    const ctx = canvas.getContext('2d');
-    if (!ctx) throw new Error('2D canvas context unavailable');
-    this.ctx = ctx;
+    this.painter = createPainter(canvas);
 
     Matter.Events.on(this.world.engine, 'collisionStart', this.onCollision);
     canvas.addEventListener('pointerdown', this.onPointerDown);
@@ -144,6 +143,7 @@ export class ToyBoxEngine {
     Matter.Events.off(this.world.engine, 'collisionStart', this.onCollision);
     this.endDrag();
     Matter.Engine.clear(this.world.engine);
+    this.painter.dispose();
   }
 
   resize(width: number, height: number): void {
@@ -186,25 +186,16 @@ export class ToyBoxEngine {
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
     const { w, h } = this.view;
 
-    this.canvas.width = Math.round(w * dpr);
-    this.canvas.height = Math.round(h * dpr);
-
-    // One transform for everything: drawing code only ever thinks in world px,
-    // and the zoom (plus the device pixel ratio) is folded in here.
-    const k = dpr / this.scale;
-    this.ctx.setTransform(k, 0, 0, k, 0, 0);
-
-    if (k !== this.pixelRatio) {
-      this.pixelRatio = k;
-      resetSprites(); // sprites are rasterised per device scale
-    }
+    // The painter owns the drawing buffer; the zoom and the device pixel ratio
+    // reach it through each frame's `Scene`.
+    this.painter.resize(w * dpr, h * dpr);
+    this.pixelRatio = dpr / this.scale;
 
     const worldW = Math.max(1, Math.round(w * this.scale));
     const worldH = Math.max(1, Math.round(h * this.scale));
     if (worldW === this.size.w && worldH === this.size.h) return;
 
     this.size = { w: worldW, h: worldH };
-    this.grid = buildGrid(worldW, worldH);
     resizeWorld(this.world, worldW, worldH);
   }
 
@@ -542,6 +533,7 @@ export class ToyBoxEngine {
       drawMs: this.drawMs,
       bodies: this.bodies.length + (this.grainWorld?.count ?? 0),
       toys,
+      renderer: this.painter.kind,
     };
   }
 
@@ -734,20 +726,19 @@ export class ToyBoxEngine {
   // --- drawing -----------------------------------------------------------
 
   private draw(): void {
-    renderScene({
-      ctx: this.ctx,
-      width: this.size.w,
-      height: this.size.h,
+    const scene: Scene = {
+      worldW: this.size.w,
+      worldH: this.size.h,
       time: this.time,
       bodies: this.bodies,
       ghost: this.currentGhost(),
-      grid: this.grid,
       draggingId: this.drag?.body.id ?? null,
       scale: this.scale,
       pixelRatio: this.pixelRatio,
       useSprites: this.sprites,
       grains: this.grainWorld,
-    });
+    };
+    this.painter.draw(scene);
   }
 
   private currentGhost(): Ghost | null {

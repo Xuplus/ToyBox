@@ -1,4 +1,4 @@
-import type { PerfStats, ToyBoxEngine, Tuning } from './engine/ToyBoxEngine';
+import type { PerfStats, Tool, ToyBoxEngine, Tuning } from './engine/ToyBoxEngine';
 import type { ToyId } from './toys/types';
 
 /** Small surface for automated measurement. See `installBenchHook`. */
@@ -19,6 +19,8 @@ export interface BenchApi {
   tune(options: Tuning): Tuning;
   /** replace the box with `n` grains (the granular prototype) */
   grains(n: number, radius?: number): number;
+  /** select a tool, as the palette would — for reproducible screenshots */
+  tool(id: Tool): void;
 }
 
 declare global {
@@ -58,5 +60,6 @@ export function installBenchHook(engine: ToyBoxEngine): void {
     scale: (n: number) => engine.setScale(n),
     tune: (options: Tuning) => engine.tune(options),
     grains: (n: number, radius?: number) => engine.spawnGrains(n, radius),
+    tool: (id: Tool) => engine.setTool(id),
   };
 }

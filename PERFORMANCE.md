@@ -13,19 +13,24 @@ depends on that, it says so.
 
 ## 1. TL;DR
 
-- Today: **~9 µs per body per step**, a 60 Hz ceiling of ~1350 bodies.
+- **The renderer is solved.** The scene now goes to the GPU as a handful of
+  instanced draw calls: **0.06–0.5 ms to draw anything from 500 to 7,747
+  bodies**, against 8.6–12.6 ms for canvas 2D at the top of that range (143–180×).
+  A 7,747-grain box went from 13 fps to 72 fps on the same machine.
+- Today: **~9 µs per body per step** on the rigid path, so the 60 Hz ceiling for
+  Matter bodies is ~1350–2000. Physics is now the *only* thing in the frame
+  budget, which is the point.
 - **48% of a step is narrowphase collision detection**, and it is expensive
   because matter-js has no circle primitive — a "circle" is a 10–25-gon, so
   every ball–ball contact is polygon SAT. This is *not* the bottleneck anyone
   usually blames (the per-step `bodies.sort` is 0.7%).
-- Solver is 29%, broadphase 9%, integration 2%, **rendering 2%** — the renderer
-  stopped being the problem once balls were blitted from a sprite cache.
+- Solver is 29%, broadphase 9%, integration 2%, rendering ~2%.
 - A typed-array granular solver does the same for balls in **0.7–1.6 µs per
   body**, 5–12× cheaper, and is in the tree as `src/physics/grains.ts`
   (`?bench` only, prototype).
 - Even so: **10k is the edge, 40k is 60 ms/step.** No JS/WASM rigid-body engine
   gets to tens of thousands at 60 Hz in a browser; that number only comes from a
-  particle layer with a batched GPU renderer.
+  particle layer with a batched GPU renderer — which is now what we have.
 
 ---
 
@@ -35,6 +40,7 @@ depends on that, it says so.
 npm run build && npx vite preview --port 4173 &
 npm run bench -- --url http://127.0.0.1:4173/ --sizes 0,500,1000,2000
 npm run bench -- --url http://127.0.0.1:4173/ --grain-sweep --sizes 5000,10000,20000
+npm run bench -- --url "http://127.0.0.1:4173/?render=2d" --sizes 0,500,2000   # A/B the painters
 npm run profile            # CPU profile, 4 s at 2000 bodies
 ```
 
@@ -46,22 +52,29 @@ DevTools protocol (dependency-free WebSocket client in `scripts/cdp.mjs`):
 | `--sizes 0,500,1000` | fill the box with N Matter balls, settle, sample |
 | `--grain-sweep` | same, but N grains |
 | `--scale 2.5` | playfield multiplier |
+| `--render 2d` | force the canvas 2D painter instead of WebGL2 |
 | `--sleeping` | `engine.enableSleeping = true` |
 | `--iterations 3,2` | position/velocity solver iterations |
-| `--no-sprites` | vector renderer instead of sprite blits |
+| `--no-sprites` | vector renderer instead of sprite blits (canvas 2D only) |
 | `--profile 4` | CPU profile, self time per function |
 | `--spawners 6 --seconds 80` | let spouts fill the box and watch it degrade |
+| `--eval-file f.js` | run a script in the page (`scripts/scenes/*.js`) |
 | `--shot out.png` | screenshot the result |
 
 `?bench=N` in the URL is the switch the harness uses: it fills the box, clears
 the starter scene and exposes `window.__toybox`
-(`src/debug.ts`). It is inert without the parameter.
+(`src/debug.ts`). It is inert without the parameter. `?render=2d|gl` forces the
+painter, for A/B measurement and screenshots.
 
 **Read `est-60hz`, not `fps`.** Headless has no vsync and its compositor ticks
 at ~145 Hz, so the raw figure tops out at 145 and overstates a 60 Hz display.
 The estimate converts the measured main-thread work into what a 60 Hz frame
 would cost: physics runs at a fixed 60 Hz whatever the frame rate, so one step
 costs `fps × sim ÷ 60`, and a 60 Hz frame is one step plus one draw.
+
+Under WebGL, `draw-ms` is CPU submission time — the GPU work is queued and
+asynchronous (see §7). It is still the right number: it is what the main thread
+pays.
 
 ---
 
@@ -243,6 +256,71 @@ This reframes everything: at 20k bodies the *renderer* was eating 30 ms of a
 16.7 ms budget and the engine was being blamed for it. With instancing, 20k
 bodies cost half a millisecond to draw, and the whole budget belongs to physics.
 
+### Done: the renderer that shipped, measured in the app
+
+That prototype is now the default painter (`src/engine/gl/`). Re-running the
+real app with `scripts/bench.mjs --render 2d|gl` on the same scene gives the
+before/after below — 1416×808, dpr 1, headless (software GL), draw time is the
+`drawMs` EMA the readout shows:
+
+| workload | canvas 2D | WebGL2 | |
+|---|---:|---:|---:|
+| 500 balls | 0.56 ms | 0.18 ms | 3.1× |
+| 1 000 balls | 1.03 ms | 0.27 ms | 3.8× |
+| 1 500 balls | 1.36 ms | 0.48 ms | 2.8× |
+| 2 000 balls | 1.83 ms | 0.45 ms | 4.1× |
+| 5 000 grains | 8.61 ms | **0.06 ms** | **143×** |
+| 7 747 grains | 12.57 ms | **0.07 ms** | **180×** |
+
+and the same 7,747-grain scene, end to end:
+
+| | canvas 2D | WebGL2 |
+|---|---:|---:|
+| frame rate | 13.1 fps | **71.9 fps** |
+| frame time | 76.7 ms | 12.2 ms |
+| draw | 12.57 ms | 0.07 ms |
+
+Two honest caveats:
+
+- **`drawMs` under WebGL measures CPU submission, not GPU work.** Instanced
+  draws are queued and the rasteriser catches up asynchronously, so 0.07 ms is
+  the cost of packing buffers and issuing ~7 draw calls — not the cost of
+  shading 7,747 circles. On a real GPU that is still nothing; under SwiftShader
+  it eventually shows up as a capped frame rate rather than as draw time. Read
+  `drawMs` as "how much of the main thread the painter takes", which is the
+  number that decides whether the frame makes its deadline.
+- The rigid-body speedup is only 3–4× because sprites had already reduced balls
+  to one `drawImage` each. Against the pre-sprite gradient path at 2 000 balls
+  it is ~18×. The dramatic win is the case that had no fast path at all: the
+  granular layer, where canvas 2D was spending 12.6 ms per frame just blitting
+  dots.
+
+What made it fast is not exotic: the whole scene is packed into five flat
+`Float32Array`s (`instances.ts` / `pack.ts`) and submitted as one instanced draw
+call per shape family. Per-toy detail that used to be a painter branch — bevels,
+crate braces, brick joints, plank grain, glass glints, belt chevrons — is now a
+`pattern` id the rect shader switches on. The backdrop (gradient, grid, floor
+shadow, frame) is one fullscreen quad of procedural fragment shader, which also
+removed the per-frame `createLinearGradient` allocations. Note labels are the
+one texture: an atlas of the ten note names, rebuilt only when the device scale
+would resample it beyond ~2×.
+
+Two bugs fell out of the port, both fixed:
+
+- `alpha(shade('#55617a', 0.45), 0.75)` produced `rgba(NaN, …)` because the
+  colour parser only understood hex and `shade()` returns `rgb()`. The canvas
+  silently ignored the invalid colour, so belts and the spout were drawn with
+  whatever stroke colour the previous toy left behind. `src/lib/color.ts` now
+  parses both forms, and `color.test.ts` pins it.
+- The "flat fill for shards" branch tested `w < 34 || h < 34`, which quietly
+  swallowed the **plank** (176×18) and made its grain-line drawing dead code.
+  Both painters now ask `meta.shard`, which is what the branch was always about.
+
+The canvas 2D painter is still here: it is the fallback when WebGL2 is
+unavailable (`?render=2d` forces it), and it is the reference the instanced path
+was checked against — `scripts/scenes/showcase.js` builds the same deterministic
+scene for both, and `scripts/bench.mjs --shot` captures it.
+
 ---
 
 ## 8. Roadmap
@@ -252,7 +330,7 @@ L ≈ a week+.
 
 | # | change | cost | win | status |
 |---|---|---|---|---|
-| 1 | **WebGL2 instanced renderer** | M | draws 58× at 20k; makes any body count possible | todo |
+| 1 | **WebGL2 instanced renderer** | M | draws 58× at 20k; makes any body count possible | **shipped** (§7) |
 | 2 | **Granular layer as a real toy** (sand/dust/water, cohesion) | M | 5–12× per body for circles | prototype |
 | 3 | Matter circle fast path in `Collision.collides` | S | 1.8–2.5× on the rigid step | todo |
 | 4 | `enableSleeping` for settled scenes + islands | S | large when the box is idle | not wired |
@@ -263,13 +341,13 @@ L ≈ a week+.
 
 Notes:
 
-- **(1) is the unlock, and it is not optional.** With the renderer at 0.5 ms, a
-  10k-body box needs only ~16 ms of physics; today's canvas costs 17 ms before
-  physics starts. Everything else in this table is secondary to it.
+- **(1) is done.** The painter now costs 0.06–0.5 ms whatever is in the box, so
+  the frame budget is entirely physics. Everything below is about the solver.
 - **(2) is what the user actually asked for** — a body that is *not* a rigid
   body: thousands of grains that look like sand or water. The prototype already
   does 10k in 12.5 ms; cohesion (a small attractive term between neighbours) and
-  two relaxation passes instead of three are the remaining tuning.
+  two relaxation passes instead of three are the remaining tuning. The renderer
+  no longer stands in its way: 7,747 grains cost 0.07 ms to draw.
 - **(3)** is ~80 lines and a test. Do it when the rigid path matters again.
 - **(6)** buys no speed, it buys a frame of headroom. Requires cross-origin
   isolation headers on the Caddy side ([MDN SAB](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/SharedArrayBuffer)).
@@ -288,10 +366,11 @@ The measured budget at 60 Hz is 16.7 ms:
 
 | workload | physics | draw (instanced) | total |
 |---|---:|---:|---:|
-| 1 000 matter balls | 4.1 ms | 0.1 ms | 4.2 ms |
+| 1 000 matter balls | 4.1 ms | 0.3 ms | 4.4 ms |
+| 1 500 matter balls | 4.9 ms | 0.5 ms | 5.4 ms |
 | 10 000 matter boxes | 13.8 ms | 0.4 ms | 14.2 ms ✅ |
-| 10 000 grains | 12.5 ms | 0.4 ms | 12.9 ms ✅ |
-| 20 000 grains | 29.6 ms | 0.5 ms | 30.1 ms ✗ |
+| 10 000 grains | 12.5 ms | 0.1 ms | 12.6 ms ✅ |
+| 20 000 grains | 29.6 ms | 0.1 ms | 29.7 ms ✗ |
 | 20 000 matter circles | 176 ms | 0.5 ms | 176 ms ✗ |
 
 So the honest ceiling right now is **~10,000 dynamic bodies at 60 Hz** — as
@@ -311,8 +390,11 @@ numbers describe:
 2. **Granular layer** (own solver): balls, sand, water, shards. Tens of
    thousands. No rotation — which the renderer never showed anyway — with
    cohesion, jetting and drag on top for liquids.
-3. **One renderer** for both: instanced circles, batched polygons, 0.5 ms at 20k.
+3. **One renderer** for both: instanced circles, batched polygons, 0.1 ms at 20k
+   — shipped, and no longer the reason anything is capped.
 
 That combination is what "the same quality but much faster" looks like here, and
-every step of it is now measured rather than assumed.
+every step of it is now measured rather than assumed. The next thing to build is
+**(2)**: the granular layer as a real toy, since it is the only way past ~2,000
+bodies and it already has a solver and a free renderer waiting for it.
 

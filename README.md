@@ -38,19 +38,25 @@ npm run build
 npx vite preview --port 4173 &
 npm run bench -- --url http://127.0.0.1:4173/ --sizes 0,500,1000,1500,2000
 npm run bench -- --url http://127.0.0.1:4173/ --spawners 6 --seconds 80
+npm run bench -- --url "http://127.0.0.1:4173/?render=2d" --sizes 0,2000
 ```
 
 Roughly: **it holds 60 fps up to ~1350 bodies** in a 1416×672 box, and physics
-is what costs — the canvas redraw of 1000 balls is about a third of the frame.
-Six spouts take about a minute to fill the box that far. The numbers, the method
-and the caveats (headless has no vsync; measured at 1× pixel density) are in
-[`PLAN.md` §9](./PLAN.md#9-performance--measured-not-guessed).
+is what costs. Drawing goes to the GPU as a handful of instanced draw calls
+(`src/engine/gl/`), so the painter takes 0.06–0.5 ms whatever is in the box —
+against 8.6–12.6 ms for the canvas 2D path at a few thousand bodies, which is
+kept as the fallback (`?render=2d`). Six spouts take about a minute to fill the
+box that far.
+
+The numbers, the method and the caveats (headless has no vsync; `draw-ms` under
+WebGL is CPU submission, not GPU work) are in
+[`PERFORMANCE.md`](./PERFORMANCE.md).
 
 For the next order of magnitude — what to cache, which corner of the simulation
 to cut, and why "tens of thousands of rigid bodies at 60 Hz" is not a thing in
-a browser — see [`PERFORMANCE.md`](./PERFORMANCE.md). That file also covers the
-granular solver prototype in [`src/physics/grains.ts`](./src/physics/grains.ts),
-which simulates circles 5–12× cheaper than the rigid-body engine.
+a browser — see the same file. It also covers the granular solver prototype in
+[`src/physics/grains.ts`](./src/physics/grains.ts), which simulates circles
+5–12× cheaper than the rigid-body engine and is the next thing to build on.
 
 ## Add a toy
 

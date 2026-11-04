@@ -12,7 +12,7 @@
 // Options: --url --sizes --scale --warmup --sample --port --browser --headed
 
 import { spawn, spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { Cdp } from './cdp.mjs';
@@ -163,6 +163,8 @@ async function main() {
   }
   const tune = Object.keys(tuning).length > 0 ? tuning : null;
   const profileSeconds = Number(args.profile ?? 0);
+  // Quoting an expression through PowerShell mangles it; a file is exact.
+  if (args['eval-file']) args.eval = readFileSync(args['eval-file'], 'utf8').trim();
   const tuneArg = tune ? `box.tune(${JSON.stringify(tune)});` : '';
 
   const profile = mkdtempSync(path.join(os.tmpdir(), 'toybox-bench-'));
@@ -186,6 +188,9 @@ async function main() {
       '--disable-backgrounding-occluded-windows',
       '--disable-features=Translate,MediaRouter',
       '--hide-scrollbars',
+      // Headless has no GPU; without this Chrome refuses the SwiftShader
+      // fallback and the WebGL renderer never comes up.
+      '--enable-unsafe-swiftshader',
       '--force-device-scale-factor=1',
       '--window-size=1440,900',
       launch.toString(),
@@ -316,7 +321,6 @@ async function main() {
       console.log(`\neval → ${JSON.stringify(result)}`);
       await sleep(400);
     }
-
     if (args.shot) {
       await cdp.request('Page.enable');
       const shot = await cdp.request('Page.captureScreenshot', { format: 'png' });

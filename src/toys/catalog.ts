@@ -225,7 +225,7 @@ function makeSpawner(): ToyDef {
 }
 
 const NOTE_W = 84;
-const NOTE_H = 28;
+export const NOTE_H = 28;
 
 /** One colour per scale degree, so the bars read as a little xylophone. */
 const NOTE_COLORS = [

@@ -3,43 +3,65 @@ import { alpha, shade } from '../lib/color';
 import type { GrainWorld } from '../physics/grains';
 import { metaOf } from '../toys/meta';
 import type { ToyMeta } from '../toys/types';
-import { ballSprite } from './sprites';
+import type { Ghost, Painter, Scene } from './scene';
+import { ballSprite, resetSprites } from './sprites';
 
 /** Sand-coloured grains, so the granular layer reads as its own material. */
 const GRAIN_COLOR = '#e0a458';
 
-/** Translucent preview of the toy that is about to be dropped. */
-export interface Ghost {
-  x: number;
-  y: number;
-  w: number;
-  h: number;
-  color: string;
-  shape: 'circle' | 'rect';
+/**
+ * The canvas 2D painter — the fallback when WebGL2 is unavailable, and the
+ * reference the instanced path is checked against.
+ *
+ * It draws one body at a time with real path operations and gradients, which is
+ * fine for a few hundred toys and is what set the ceiling at ~1,350 bodies
+ * before the WebGL path existed. See `PERFORMANCE.md §7`.
+ */
+export class Canvas2DPainter implements Painter {
+  readonly kind = 'canvas2d';
+
+  private grid: Path2D | null = null;
+  private gridW = 0;
+  private gridH = 0;
+  private pixelRatio = 1;
+
+  constructor(
+    private readonly canvas: HTMLCanvasElement,
+    private readonly ctx: CanvasRenderingContext2D,
+  ) {}
+
+  resize(deviceW: number, deviceH: number): void {
+    this.canvas.width = Math.max(1, Math.round(deviceW));
+    this.canvas.height = Math.max(1, Math.round(deviceH));
+  }
+
+  draw(scene: Scene): void {
+    const { ctx } = this;
+
+    // One transform for everything: drawing code only ever thinks in world px,
+    // and the zoom (plus the device pixel ratio) is folded in here.
+    if (scene.pixelRatio !== this.pixelRatio) {
+      this.pixelRatio = scene.pixelRatio;
+      resetSprites(); // sprites are rasterised per device scale
+    }
+    ctx.setTransform(scene.pixelRatio, 0, 0, scene.pixelRatio, 0, 0);
+
+    if (!this.grid || this.gridW !== scene.worldW || this.gridH !== scene.worldH) {
+      this.grid = buildGrid(scene.worldW, scene.worldH);
+      this.gridW = scene.worldW;
+      this.gridH = scene.worldH;
+    }
+
+    renderScene(ctx, scene, this.grid);
+  }
+
+  dispose(): void {
+    // The canvas belongs to React; nothing to release here.
+  }
 }
 
-export interface RenderInput {
-  ctx: CanvasRenderingContext2D;
-  width: number;
-  height: number;
-  /** milliseconds, same clock as `performance.now()` */
-  time: number;
-  bodies: Matter.Body[];
-  ghost: Ghost | null;
-  grid: Path2D | null;
-  draggingId: number | null;
-  /** world px per css px; hairlines are widened by it so they survive a zoom-out */
-  scale: number;
-  /** device px per world px — sprites are rasterised at this density */
-  pixelRatio: number;
-  /** blit cached ball sprites instead of rebuilding gradients per body */
-  useSprites: boolean;
-  /** experimental granular layer, drawn behind the rigid bodies */
-  grains: GrainWorld | null;
-}
-
-export function renderScene(input: RenderInput): void {
-  const { ctx, width, height, grid, scale } = input;
+export function renderScene(ctx: CanvasRenderingContext2D, input: Scene, grid: Path2D | null): void {
+  const { worldW: width, worldH: height, scale } = input;
 
   drawBackground(ctx, width, height, grid, scale);
 
@@ -312,7 +334,9 @@ function drawBlock(ctx: CanvasRenderingContext2D, body: Matter.Body, meta: ToyMe
   }
 
   // Shards are many and short-lived: a flat fill keeps a big break cheap.
-  if (w < 34 || h < 34) {
+  // (This used to guess from the size, which quietly swallowed the plank and
+  // its grain line — the metadata knows, so ask it.)
+  if (meta.shard) {
     ctx.fillStyle = shade(meta.color, -0.08);
     roundedRect(ctx, -w / 2, -h / 2, w, h, Math.min(3, radius));
     ctx.fill();

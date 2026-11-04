@@ -52,17 +52,29 @@ bundle served by Caddy**, and the `/toybox` prefix is baked into the build via
   pitch, spawner rate) in a `WeakMap`.
 - `src/engine/` — `ToyBoxEngine.ts` owns the RAF loop, pointer input
   (spawn / drag / delete), collision handling (note strikes, shattering), the
-  spawners, the playfield scale and body limits; `render.ts` is all the canvas 2D
-  drawing.
+  spawners, the playfield scale and body limits. Drawing goes through a
+  **`Painter`** (`scene.ts`): `createPainter` gives the engine a WebGL2 painter
+  if the browser will provide one and the canvas 2D painter otherwise.
+- `src/engine/gl/` — the default painter. `pack.ts` turns a `Scene` into flat
+  instance arrays (this is the old `render.ts` body, turned inside out), and
+  `GLRenderer.ts` submits them as one instanced draw call per shape family.
+  `shaders.ts` holds the GLSL; the layouts in `instances.ts` are the contract
+  with it. `labels.ts` is the note-name texture atlas. It is pure enough to unit
+  test — `pack.test.ts` never creates a GL context.
+- `src/engine/render.ts` — the canvas 2D painter: one body at a time, real
+  paths and gradients. It is the fallback (`?render=2d`) and the reference the
+  instanced path is checked against, so a change to the look usually lands in
+  both.
 - `src/lib/` — `frame-meter.ts` (rolling window of frame durations → fps, p95,
   mean) and `color.ts` (shade/alpha). Pure, no DOM.
 - `src/physics/grains.ts` — the **granular layer prototype**: circles in
   `Float32Array`s, counting-sort uniform grid, relaxation passes. No rotation,
   so it is for balls only; 5–12× cheaper per body than Matter. Reached through
   `?bench` (`__toybox.grains(n)`), not yet wired into the toy.
-- `src/engine/sprites.ts` — pre-rendered ball sprites. Drawing a ball from
-  gradients costs ~4× a blit; at a thousand balls that is a third of the frame.
-  Rebuilds when the device scale changes (`setScale`/DPR).
+- `src/engine/sprites.ts` — pre-rendered ball sprites, **canvas 2D path only**.
+  Drawing a ball from gradients costs ~4× a blit; at a thousand balls that is a
+  third of the frame. The WebGL path shades circles in a fragment shader and
+  needs none of this.
 - `src/debug.ts` — the `?bench=N` hook. Not part of the toy: see below.
 - `src/audio/` — `notes.ts` (scale + note naming, pure) and `synth.ts` (a tiny
   WebAudio synth — every sound is generated, no audio files).
@@ -79,7 +91,10 @@ npm run test         # vitest — physics/, toys/, audio/, lib/ pure logic
 npm run build        # tsc --noEmit + vite build → ./dist
 npm run bench -- --url http://127.0.0.1:4173/ --sizes 0,500,1000
                      # headless frame-rate measurement, see PERFORMANCE.md
+npm run bench -- --url "http://127.0.0.1:4173/?render=2d" --sizes 0,2000
+                     # ...and the same scene through the fallback painter
 npm run profile       # CPU profile: which function inside the step costs what
+npm run shootout      # matter vs rapier, canvas vs instanced (bench/)
 ```
 
 Always run `npm run typecheck` and `npm run test` after changes.
@@ -113,7 +128,17 @@ Always run `npm run typecheck` and `npm run test` after changes.
   coordinates — only `toWorld()` and `applyScale()` know about the zoom.
 - **`?bench=N` is a benchmark switch, not a feature.** It lives in
   `src/debug.ts`, adds `window.__toybox`, and must stay invisible without the
-  query parameter. Never call it from product code.
+  query parameter. Never call it from product code. `?render=2d|gl` is the same
+  kind of switch: it forces a painter for A/B measurement.
+- **Both painters draw the same `Scene`.** The scene is plain data; the WebGL
+  path packs it (`pack.ts`) and the canvas path walks it (`render.ts`). A new
+  toy or visual detail lands in both — check with
+  `--eval-file scripts/scenes/showcase.js --shot` on `?render=2d` and the
+  default. The GLSL in `shaders.ts` and the strides/offsets in `instances.ts`
+  are one contract: change them together, or a toy silently draws as garbage.
+- **Never add a `drawImage`/gradient to the hot path.** If it needs per-frame
+  geometry, give it an instance and a `pattern` id instead. The whole point of
+  the instanced painter is that the cost of a body is a few float writes.
 - **Shared header UX.** Top bar in normal flow — home (`🏠`, `href="/"` → the
   `elnuevos.es` root) + `🧰` title on the left, controls and language on the
   right. Never absolutely positioned. Mirrors the sibling games.
@@ -140,9 +165,13 @@ wedge ramp), breakable glass and brick, two conveyor belts, a ball spout, pitche
 note blocks (C major pentatonic, cycling), pause, mute, clear, EN/ES, responsive
 palette, a live FPS/bodies readout, and the playfield size control.
 
-Performance is measured, not estimated: `PLAN.md §9` has the body-count curves
-and `npm run bench` reproduces them. The short version: 60 fps holds to ~1350
-bodies in a 1416×672 box, and the physics step — not the painter — is the wall.
+Performance is measured, not estimated: `PERFORMANCE.md` has the curves and
+`npm run bench` reproduces them. The short version: **the painter is no longer
+the wall** — the WebGL2 path draws anything from 500 to 7,747 bodies in
+0.06–0.5 ms, against 8.6–12.6 ms for canvas 2D at the top of that range — so the
+physics step is the only thing left in the 16.7 ms budget, and that is what
+`est-60hz` in the bench output tells you. The next lever is the granular layer
+(`physics/grains.ts`), which is the only way past ~2,000 bodies.
 
 Ideas still open (see `PLAN.md §8`): saving a scene in `localStorage`, a
 "shake" button, funnels/dominoes as extra toy families, a sound-block octave
