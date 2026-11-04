@@ -96,6 +96,7 @@ function drawGrains(
     ballSprite(material.color, world.options.radius, pixelRatio, {
       rim: material.border > 0,
       alpha: material.alpha,
+      soft: material.liquid,
     }),
   );
   const halves = sprites.map((sprite) => sprite.extent / 2);

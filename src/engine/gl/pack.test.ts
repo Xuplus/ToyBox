@@ -302,9 +302,15 @@ describe('packScene — grains', () => {
     expect(d[DOT.color + 3]).toBeCloseTo(water.alpha, 5);
     expect(d[DOT.border]).toBe(0);
 
-    // ...and sand in the same buffer keeps its rim.
+    // ...and it is flagged for the liquid path in the shader: soft edge, flat
+    // fill, no specular. Sand keeps its hard rim and its lit ball shading.
+    expect(d[DOT.liquid]).toBe(1);
+    expect(d[DOT_STRIDE + DOT.liquid]).toBe(1);
+
+    // ...and sand in the same buffer keeps its rim and its lit shading.
     const last = 2 * DOT_STRIDE;
     expect(d[last + DOT.border]).toBe(MATERIALS[GRAIN.sand].border);
+    expect(d[last + DOT.liquid]).toBe(0);
     // Two materials, one draw call: still nothing in the ball buffers.
     expect(out.circles.count).toBe(0);
   });

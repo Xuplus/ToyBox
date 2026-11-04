@@ -57,16 +57,16 @@ export class Instances {
 }
 
 /**
- * dot / circle core: position, radius, premultiply-safe RGBA fill, and a 0..1
- * scale on the outline.
+ * dot / circle core: position, radius, premultiply-safe RGBA fill, a 0..1 scale
+ * on the outline, and a flag for a liquid.
  *
  * The outline colour itself is not per instance: it is a *constant* vertex
- * attribute, which is what keeps a grain down to eight floats. The scalar is
- * what varies — sand wants a rim, water must not have one or its droplets read
+ * attribute, which is what keeps a grain down to nine floats. The scalar is
+ * what varies - sand wants a rim, water must not have one or its droplets read
  * as beads instead of a puddle.
  */
-export const DOT_STRIDE = 8;
-export const DOT = { x: 0, y: 1, radius: 2, color: 3, border: 7 } as const;
+export const DOT_STRIDE = 9;
+export const DOT = { x: 0, y: 1, radius: 2, color: 3, border: 7, liquid: 8 } as const;
 
 /** per-circle styling: halo strength, outline RGBA, dash period (0 = solid) */
 export const CIRCLE_STYLE_STRIDE = 6;

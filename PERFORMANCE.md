@@ -193,8 +193,8 @@ Measured in the app (`?bench`, `box.grains(n)`), box 1416×606, `est-60hz`:
 |---:|---:|---|---:|---:|
 | 4 000 | 3 | all falling | 1.55 | 0.39 |
 | 8 000 | 3 | all falling | 4.86 | 0.61 |
-| 4 000 | 3 | settled | **0.07** | 0.02 |
-| 8 000 | 3 | settled | **0.24** | 0.03 |
+| 4 000 | 3 | settled | **0.10** | 0.03 |
+| 8 000 | 3 | settled | **0.29** | 0.04 |
 | 7 000 | 5 | 64% packed (a full box) | 4.2 | 0.6 |
 
 Three things fall out of that table:
@@ -240,6 +240,36 @@ With both in place, waking a settled heap moves it by a mean of 1 px, and a grai
 arriving at 12 px/step makes a crater instead of an explosion - both pinned by
 tests in `grains.test.ts`.
 
+### The other half of the coupling: sand resists
+
+Grains are pushed out of every rigid body, which on its own makes a body an
+irresistible force - a ball ploughs through a dune as if it were not there,
+because a grain is 1/700 of a body's mass and can take no momentum from it.
+So each contact also records the momentum the *body* gave up (the grain's
+velocity change), and the engine applies it back as a force:
+
+- `GRAIN_FORCE` (weight) is the static half: a pile resting on a crate weighs
+  on it, off-centre piles tip it.
+- `GRAIN_DRAG` (momentum) is the dynamic half: every grain the body displaces
+  takes velocity away from it. `DRAG_GAIN` is set well above the physical mass
+  ratio, because what stops a ball in sand is not the one grain it touches but
+  the whole jammed pile behind it.
+
+The measured result: a cannonball dropped on a sand cone now comes to rest in
+the crater it makes, and rolls down the slope when it lands off-centre.
+
+### Sand and water are not the same material
+
+| | friction | cohesion | rolling | restitution |
+|---|---:|---:|---:|---:|
+| sand | 0.22 | 0 | 0.90 | 0.10 |
+| water | 0.01 | 0.12 | 1.00 | 0.02 |
+
+Sand holds an angle of repose and stops rolling; water has almost no friction,
+enough cohesion to hold a surface, and no rolling resistance at all, so it
+runs, spreads and levels. The two are visibly different materials in the box -
+a cone and a puddle - and that difference is entirely in that table.
+
 ### What it gives up, and why that is the right trade
 
 - **Rotation.** Sand shows no rotation anyway. Anything that *does* rotate
@@ -247,9 +277,10 @@ tests in `grains.test.ts`.
 - **Stacking of shapes.** A grain pile is held up by contacts, not by a solver
   that understands torque, so a stack of grains is a heap and not a tower. That
   is exactly what sand does.
-- **Water is not a fluid.** Cohesion plus low friction plus translucency reads as
-  a liquid at this scale; it does not level like a real one, it does not have a
-  pressure field, and it does not float things. A real SPH/PBF solver is a
+- **Water is not a fluid.** It runs, spreads and levels, and with the liquid
+  shading it reads as a body of water - but there is no pressure field, no
+  buoyancy and no floating. It is a pile of very slippery, slightly sticky
+  circles that happens to look like a puddle. A real SPH/PBF solver is a
   different project.
 
 ---

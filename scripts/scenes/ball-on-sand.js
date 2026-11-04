@@ -13,7 +13,7 @@
   // Let a cone build up, then drop something heavy on it.
   await new Promise((resolve) => setTimeout(resolve, 3200));
   box.place('ballHeavy', w * 0.2, 200);
-  await new Promise((resolve) => setTimeout(resolve, 900));
+  await new Promise((resolve) => setTimeout(resolve, 1400));
 
   return box.stats();
 })()

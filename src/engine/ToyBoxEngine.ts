@@ -4,6 +4,7 @@ import { FrameMeter } from '../lib/frame-meter';
 import { carryBodies } from '../physics/conveyor';
 import {
   GRAIN,
+  GRAIN_DRAG,
   GRAIN_FORCE,
   GrainWorld,
   scatterGrains,
@@ -378,6 +379,7 @@ export class ToyBoxEngine {
     grains.step(this.colliderView);
 
     const load = GRAIN_FORCE;
+    const drag = GRAIN_DRAG;
     for (let i = 0; i < this.colliderView.length; i++) {
       const body = this.colliderView[i].body;
       if (body.isStatic) continue;
@@ -385,11 +387,21 @@ export class ToyBoxEngine {
       const fx = grains.loadFx[i];
       const fy = grains.loadFy[i];
       const torque = grains.loadTorque[i];
-      if (fx === 0 && fy === 0 && torque === 0) continue;
+      if (fx !== 0 || fy !== 0 || torque !== 0) {
+        body.force.x += fx * load;
+        body.force.y += fy * load;
+        body.torque += torque * load;
+      }
 
-      body.force.x += fx * load;
-      body.force.y += fy * load;
-      body.torque += torque * load;
+      // The grains the body pushed, pushing back: this is the sand's resistance.
+      const dx = grains.dragX[i];
+      const dy = grains.dragY[i];
+      const spin = grains.dragTorque[i];
+      if (dx !== 0 || dy !== 0 || spin !== 0) {
+        body.force.x += dx * drag;
+        body.force.y += dy * drag;
+        body.torque += spin * drag;
+      }
     }
   }
 

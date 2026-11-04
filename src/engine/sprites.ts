@@ -6,7 +6,7 @@
 // (colour, radius, device scale) and blitted with a single drawImage - which is
 // also what makes a canvas of thousands of bodies possible at all.
 
-import { shade } from '../lib/color';
+import { alpha, shade } from '../lib/color';
 
 type Sprite = HTMLCanvasElement;
 
@@ -26,6 +26,9 @@ export interface SpriteStyle {
   rim?: boolean;
   /** fill opacity - the granular layer's water is translucent */
   alpha?: number;
+  /** a liquid: flat translucent fill, feathered edge, no rim and no specular,
+   *  so a cluster of them reads as one body of water (see the GL shader) */
+  soft?: boolean;
 }
 
 /**
@@ -40,10 +43,11 @@ export function ballSprite(
   k: number,
   style: SpriteStyle = {},
 ): BallSprite {
-  const rim = style.rim !== false;
+  const rim = style.rim !== false && style.soft !== true;
+  const soft = style.soft === true;
   const opacity = style.alpha ?? 1;
   const extent = radius * 2 + PAD;
-  const key = `${color}|${radius}|${k}|${rim ? 1 : 0}|${opacity}`;
+  const key = `${color}|${radius}|${k}|${rim ? 1 : 0}|${opacity}|${soft ? 1 : 0}`;
   const hit = cache.get(key);
   if (hit) return hit;
 
@@ -56,10 +60,27 @@ export function ballSprite(
   if (!g) return { canvas, extent };
 
   g.setTransform(k, 0, 0, k, 0, 0);
-  g.globalAlpha = opacity;
 
   const c = extent / 2;
   const r = radius;
+
+  if (soft) {
+    // Flat colour fading out at the rim, exactly like the shader's liquid path.
+    const blob = g.createRadialGradient(c, c, 0, c, c, r * 1.18);
+    blob.addColorStop(0, alpha(color, opacity));
+    blob.addColorStop(0.62, alpha(color, opacity));
+    blob.addColorStop(1, alpha(color, 0));
+    g.fillStyle = blob;
+    g.beginPath();
+    g.arc(c, c, r * 1.18, 0, Math.PI * 2);
+    g.fill();
+
+    const liquid: BallSprite = { canvas, extent };
+    cache.set(key, liquid);
+    return liquid;
+  }
+
+  g.globalAlpha = opacity;
 
   const fill = g.createRadialGradient(c - r * 0.35, c - r * 0.4, r * 0.1, c, c, r * 1.05);
   fill.addColorStop(0, shade(color, 0.55));

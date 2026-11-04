@@ -73,7 +73,8 @@ bundle served by Caddy**, and the `/toybox` prefix is baked into the build via
   9, and a settled pile sleeps, so it is cheaper again once it stops.
   `MATERIALS` at the top of the file is the only description of what each
   material is: colour, alpha, rim, friction, restitution, cohesion, rolling
-  resistance, sleep. Both painters read it, so a new material is one entry.
+  resistance, whether it is drawn as a liquid, and how it sleeps. Both painters
+  read it, so a new material is one entry.
 - `src/engine/sprites.ts` — pre-rendered ball sprites, **canvas 2D path only**.
   Drawing a ball from gradients costs ~4× a blit; at a thousand balls that is a
   third of the frame. The WebGL path shades circles in a fragment shader and
@@ -159,9 +160,19 @@ Always run `npm run typecheck` and `npm run test` after changes.
   one look like an explosion. Tangential motion must stay untouched, or sand
   stops flowing and water stops levelling.
 - **Perfect circles roll for ever.** `rolling` in `MATERIALS` is the only reason
-  a flat layer of grains ever stops: 0.9 for sand, 0.995 for water. It applies
-  only to contacted grains slower than `ROLL_SPEED`, so a falling stream is
-  unaffected.
+  a flat layer of grains ever stops: 0.9 for sand, and 1 (none) for water. It
+  applies only to contacted grains slower than `ROLL_SPEED`, so a falling stream
+  is unaffected.
+- **The coupling is two-way.** `loadFx/loadFy/loadTorque` carry the weight of
+  the pile into a body (`GRAIN_FORCE`), and `dragX/dragY/dragTorque` carry the
+  momentum it gave up pushing grains around (`GRAIN_DRAG`). Remove either and a
+  ball is either weightless to the sand or an irresistible force through it.
+  `DRAG_GAIN` is deliberately far above the physical mass ratio: what resists a
+  ball is the jammed pile behind each grain, not one grain's mass.
+- **A liquid is drawn, not simulated.** `liquid` in `MATERIALS` switches the dot
+  pipeline to a flat fill with a feathered edge and no specular (`aLiquid` in
+  `shaders.ts`), which is what makes a cluster read as one body of water. The
+  physics underneath is still circles; do not expect pressure or buoyancy.
 - **Shared header UX.** Top bar in normal flow — home (`🏠`, `href="/"` → the
   `elnuevos.es` root) + `🧰` title on the left, controls and language on the
   right. Never absolutely positioned. Mirrors the sibling games.
@@ -195,7 +206,7 @@ Performance is measured, not estimated: `PERFORMANCE.md` has the curves and
 wall** — WebGL2 draws anything from 500 to 20,000 bodies in 0.06–0.5 ms — and
 the two ceilings are 9 µs per rigid body (matter, ~2,000 of them at 60 Hz) and
 packing density for grains (8,000 moving grains is 4.9 ms; the same 8,000
-settled is 0.24 ms; a box packed past ~60% never settles at all).
+settled is 0.29 ms; a box packed past ~60% never settles at all).
 
 Ideas still open (see `PLAN.md §8`): saving a scene in `localStorage`, a
 "shake" button, funnels/dominoes as extra toy families, ropes and explosives on

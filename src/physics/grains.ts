@@ -47,9 +47,12 @@ export interface GrainMaterialSpec {
   restitution: number;
   /** px of pull across the contact gap per pass - surface tension */
   cohesion: number;
-  /** fraction of the speed a slow, contacted grain keeps per step. Perfect\r
-   *  circles roll for ever on a flat floor; real sand is angular and stops, and\r
-   *  this is the cheapest honest approximation of that. */
+  /** true for a true liquid: flat translucent fill and a feathered edge, so a
+   *  cluster reads as one body of water instead of a heap of blue beads */
+  liquid: boolean;
+  /** fraction of the speed a slow, contacted grain keeps per step. Perfect
+   *  circles roll for ever on a flat floor; real sand is angular and stops,
+   *  and water does not stop at all. */
   rolling: number;
   /** quiet windows before a grain is put to sleep. Water needs more, because
    *  a puddle that has not finished levelling still has somewhere to go. */
@@ -66,19 +69,21 @@ export const MATERIALS: readonly GrainMaterialSpec[] = [
     friction: 0.22,
     restitution: 0.1,
     cohesion: 0,
+    liquid: false,
     rolling: 0.9,
     sleepWindows: 1,
   },
   {
-    // Water: barely any friction and a little cohesion, so it flows, levels,
-    // and holds a surface instead of scattering into a film of lone droplets.
-    color: '#4fa8e8',
-    alpha: 0.78,
+    // Water: almost no friction and enough cohesion to hold a surface, so it
+    // runs, levels and spreads instead of standing in a heap.
+    color: '#3f9fe6',
+    alpha: 0.62,
     border: 0,
-    friction: 0.03,
-    restitution: 0.04,
-    cohesion: 0.06,
-    rolling: 0.995,
+    friction: 0.01,
+    restitution: 0.02,
+    cohesion: 0.12,
+    liquid: true,
+    rolling: 1,
     sleepWindows: 2,
   },
 ];
@@ -138,6 +143,20 @@ const GRAINS_PER_MASS = 700;
 
 /** The force one grain leaves on a body, matching `mass * gravity.scale`. */
 export const GRAIN_FORCE = GRAVITY_SCALE / GRAINS_PER_MASS;
+
+/**
+ * The force a body feels for every px/step of velocity it takes away from a
+ * grain it pushed.
+ *
+ * This is the other half of the coupling, and it is what makes sand *resist*.
+ * A grain weighs 1/700 of a body, so the momentum it can take on its own is
+ * nothing - a ball would plough through a dune without slowing. What actually
+ * stops it is that the grain it pushes cannot go anywhere: it is jammed
+ * against the pile behind it. `DRAG_GAIN` is that jamming, expressed as "how
+ * many grains' worth of momentum does one displaced grain cost the body".
+ */
+const DRAG_GAIN = 300;
+export const GRAIN_DRAG = (GRAIN_FORCE / GRAVITY_ACCEL) * DRAG_GAIN;
 
 /** Colliders are capped so a shatter storm can't turn the grain pass quadratic. */
 const MAX_COLLIDERS = 512;
@@ -217,6 +236,11 @@ export class GrainWorld {
   readonly loadFx = new Float32Array(MAX_COLLIDERS);
   readonly loadFy = new Float32Array(MAX_COLLIDERS);
   readonly loadTorque = new Float32Array(MAX_COLLIDERS);
+  /** per-collider accumulated momentum taken from the body by the grains it
+   *  pushed, in px/step of grain velocity */
+  readonly dragX = new Float32Array(MAX_COLLIDERS);
+  readonly dragY = new Float32Array(MAX_COLLIDERS);
+  readonly dragTorque = new Float32Array(MAX_COLLIDERS);
 
   constructor(capacity: number, width: number, height: number, options: Partial<GrainOptions> = {}) {
     // An explicit `undefined` must not shadow a default: `{ radius: undefined }`
@@ -708,6 +732,9 @@ export class GrainWorld {
       this.loadFx[c] = 0;
       this.loadFy[c] = 0;
       this.loadTorque[c] = 0;
+      this.dragX[c] = 0;
+      this.dragY[c] = 0;
+      this.dragTorque[c] = 0;
 
       // Centroid, so the outward normal never depends on the winding order -
       // Matter does not promise one, and a wedge built by `fromVertices` does
@@ -921,6 +948,8 @@ export class GrainWorld {
     // Velocity: split the slip against the surface, reflect the normal part
     // with restitution, kill a fraction of the tangent with friction, and add
     // the surface's own drift (a belt) back on.
+    const beforeX = this.vx[i];
+    const beforeY = this.vy[i];
     const material = MATERIALS[this.kind[i]];
     const svx = this.colVelX[c] + this.colSurfX[c];
     const svy = this.colVelY[c] + this.colSurfY[c];
@@ -944,6 +973,16 @@ export class GrainWorld {
     this.loadFx[c] += fx;
     this.loadFy[c] += fy;
     this.loadTorque[c] += (gx - this.colCx[c]) * fy - (gy - this.colCy[c]) * fx;
+
+    // Momentum: whatever the grain lost, the body gained. This is what makes a
+    // ball sink into sand instead of falling through it as if it were not there.
+    const dx = beforeX - this.vx[i];
+    const dy = beforeY - this.vy[i];
+    if (dx !== 0 || dy !== 0) {
+      this.dragX[c] += dx;
+      this.dragY[c] += dy;
+      this.dragTorque[c] += (gx - this.colCx[c]) * dy - (gy - this.colCy[c]) * dx;
+    }
   }
 }
 

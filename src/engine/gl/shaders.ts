@@ -85,6 +85,7 @@ in float aGlow;
 in vec4 aBorder;
 in float aDash;
 in float aBorderScale;
+in float aLiquid;
 
 uniform vec2 uWorld;
 
@@ -95,10 +96,13 @@ flat out vec4 vBorder;
 flat out float vDash;
 flat out float vGlow;
 flat out float vBorderScale;
+flat out float vLiquid;
 
 void main() {
-  float pad = 3.0 + aGlow * 55.0;
-  float extent = aRadius + pad;
+  // A liquid is drawn fatter than it collides so its feathered edge overlaps
+  // its neighbours. That overlap is what turns a heap of droplets into a body.
+  float pad = 3.0 + aGlow * 55.0 + aLiquid * aRadius * 0.35;
+  float extent = aRadius * (1.0 + aLiquid * 0.18) + pad;
   vec2 p = aPos + aCorner * extent;
   vec2 clip = p / uWorld * 2.0 - 1.0;
   gl_Position = vec4(clip.x, -clip.y, 0.0, 1.0);
@@ -110,6 +114,7 @@ void main() {
   vDash = aDash;
   vGlow = aGlow;
   vBorderScale = aBorderScale;
+  vLiquid = aLiquid;
 }`;
 
 export const CIRCLE_FS = `#version 300 es
@@ -122,6 +127,7 @@ flat in vec4 vBorder;
 flat in float vDash;
 flat in float vGlow;
 flat in float vBorderScale;
+flat in float vLiquid;
 out vec4 outColor;
 
 void main() {
@@ -130,6 +136,19 @@ void main() {
   float sdf = dist - r;
   float aa = max(fwidth(dist), 0.0001);
   float inside = clamp((aa - sdf) / (2.0 * aa), 0.0, 1.0);
+
+  if (vLiquid > 0.5) {
+    // A liquid is not a disc. A feathered edge means overlapping grains fuse
+    // into one body with a soft boundary, and premultiplied alpha makes the
+    // interior denser where more of them overlap - which is what reads as
+    // depth. No specular: a puddle is not a billiard ball.
+    float soft = clamp((r * 1.18 - dist) / (r * 0.62), 0.0, 1.0);
+    soft = soft * soft * (3.0 - 2.0 * soft);
+    float alpha = soft * vColor.a;
+    if (alpha <= 0.002) discard;
+    outColor = vec4(vColor.rgb * alpha, alpha);
+    return;
+  }
 
   // Radial fill lit from the top left — the same stops as the canvas sprite.
   vec2 centre = vec2(-0.35, -0.40) * r;

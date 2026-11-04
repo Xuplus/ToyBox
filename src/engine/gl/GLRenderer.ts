@@ -289,6 +289,7 @@ export class GLRenderer implements Painter {
       { name: 'aRadius', size: 1, buffer: core, stride: DOT_STRIDE, offset: DOT.radius, divisor: 1 },
       { name: 'aColor', size: 4, buffer: core, stride: DOT_STRIDE, offset: DOT.color, divisor: 1 },
       { name: 'aBorderScale', size: 1, buffer: core, stride: DOT_STRIDE, offset: DOT.border, divisor: 1 },
+      { name: 'aLiquid', size: 1, buffer: core, stride: DOT_STRIDE, offset: DOT.liquid, divisor: 1 },
     ];
     if (!style) return setups;
     return setups.concat([

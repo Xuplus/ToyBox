@@ -39,6 +39,9 @@ const GRAIN_FILL = MATERIALS.map((material) => {
 /** How strong the shared rim is on each material; 0 merges water into a mass. */
 const GRAIN_RIM = MATERIALS.map((material) => material.border);
 
+/** 1 for a material drawn as a liquid: soft edge, flat fill, no specular. */
+const GRAIN_LIQUID = MATERIALS.map((material) => (material.liquid ? 1 : 0));
+
 /**
  * Outline + halo colour every grain shares, as a constant vertex attribute. The
  * per-instance float scales it: sand keeps the rim, water switches it off.
@@ -145,6 +148,7 @@ function packGrains(dots: Instances, grains: GrainWorld): void {
     d[at + DOT.color + 2] = fill[2];
     d[at + DOT.color + 3] = fill[3];
     d[at + DOT.border] = GRAIN_RIM[kind[i]];
+    d[at + DOT.liquid] = GRAIN_LIQUID[kind[i]];
     at += DOT_STRIDE;
   }
   dots.count += count;
@@ -164,6 +168,7 @@ function pushCircle(
   glow = 0,
   dash = 0,
   rim = 1,
+  liquid = 0,
 ): void {
   const at = out.circles.slot();
   const d = out.circles.data;
@@ -175,6 +180,7 @@ function pushCircle(
   d[at + DOT.color + 2] = color[2] * K;
   d[at + DOT.color + 3] = fillAlpha;
   d[at + DOT.border] = rim;
+  d[at + DOT.liquid] = liquid;
 
   const st = out.styles.slot();
   const s = out.styles.data;
@@ -787,6 +793,7 @@ function packGhost(out: SceneBuffers, ghost: Ghost): void {
     d[at + DOT.color + 2] = color[2] * K;
     d[at + DOT.color + 3] = 0.06;
     d[at + DOT.border] = 1;
+    d[at + DOT.liquid] = 0;
 
     const st = out.ghostStyle.slot();
     const s = out.ghostStyle.data;
