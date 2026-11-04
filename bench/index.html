@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>ToyBox — engine shootout</title>
+    <style>
+      body { background:#0b0d13; color:#e8eaf0; font:14px/1.4 system-ui,sans-serif; margin:0; padding:16px; }
+      canvas { display:block; background:#141823; }
+      pre { white-space:pre-wrap; }
+    </style>
+  </head>
+  <body>
+    <canvas id="board" width="800" height="600"></canvas>
+    <pre id="out">loading…</pre>
+    <!-- matter-js is UMD: a plain script tag puts it on window.Matter. -->
+    <script src="../node_modules/matter-js/build/matter.js"></script>
+    <script type="module" src="./bench.js"></script>
+  </body>
+</html>

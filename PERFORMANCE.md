@@ -185,70 +185,134 @@ answer there is one instanced draw call, not 10,000 `drawImage`s.
 
 ---
 
-## 7. Roadmap
+## 7. Should we port the engine? Measured: no
 
-Ordered by (win ÷ cost). Effort: S ≈ hours, M ≈ days, L ≈ a week+.
+Before committing to a Rapier2D port I ran the two engines side by side in the
+same browser, same scene, same 60 Hz step, timing only the step call
+(`bench/`, `npm run shootout`). Bodies are laid out at **constant density** —
+the box is divided into exactly `n` cells — so this compares cost per body, not
+how fast each engine crushes a pile.
 
-| # | change | cost | expected win | status |
-|---|---|---|---|---|
-| 1 | Sprite cache for balls | S | draw 4.5× | **done** |
-| 2 | Circle fast path in `Collision.collides` | S | 1.8–2.5× total step | todo |
-| 3 | Granular layer for balls (+ spawner/link) | M | 5–12× per body | prototype |
-| 4 | Batched render: one instanced draw (WebGL2) | M | draw 10–50× at high counts | todo |
-| 5 | Worker + `SharedArrayBuffer` + interpolation | M | step time unchanged, +16.7 ms budget, no jank | todo |
-| 6 | Swap the rigid core for Rapier2D (WASM) | L | 3–8× on the rigid path | todo |
+Circles (ms per step):
 
-Notes on the two big ones:
+| bodies | matter | rapier | ratio |
+|---:|---:|---:|---:|
+| 500 | 1.84 | 0.72 | 2.5× |
+| 1 000 | 4.14 | 1.86 | 2.2× |
+| 2 000 | 9.61 | 2.95 | 3.3× |
+| 5 000 | 30.07 | 12.01 | 2.5× |
+| 10 000 | 64.32 | 81.69 | **0.8×** |
+| 20 000 | 175.69 | 953.61 | **0.2×** |
 
-- **Worker + SAB** does not make anything faster; it buys a frame of headroom
-  and keeps the UI responsive. Requires cross-origin isolation headers
-  (`COOP: same-origin` + `COEP: require-corp`) on the Caddy side —
-  `SharedArrayBuffer` is unavailable without them
-  ([MDN](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/SharedArrayBuffer)).
-  The pattern: the worker owns the world, writes poses into a double-buffered
-  SAB, and the main thread interpolates by `alpha = accumulator/step`. Physics
-  can then run at 30 Hz with 60 Hz rendering, which doubles the budget for free.
-- **Rapier2D** is the only credible way to move the *rigid* (rotating, stacking)
-  path an order of magnitude. Native benchmarks: 20,100-box 2D pyramid in 9–11
-  ms single-threaded (~0.5 µs/body — 20× cheaper than Matter here)
-  ([dimforge Q3 2026 report](https://dimforge.com/blog/2026/10/25/dimforge-Q3-technical-report/)).
-  The browser build is single-threaded WASM, so expect 1.5–2.5× the native
-  per-body cost plus JS binding overhead → **3,000–8,000 rigid bodies at 60 Hz**
-  is the realistic browser ceiling, not 30,000. Use `@dimforge/rapier2d-simd`
-  for the SIMD build. Box2D v3 is the runner-up and is genuinely ~2× faster with
-  SIMD ([simd-matters](https://box2d.org/posts/2024/08/simd-matters/)).
+Boxes:
+
+| bodies | matter | rapier | ratio |
+|---:|---:|---:|---:|
+| 500 | 0.54 | 1.26 | **0.4×** |
+| 1 000 | 1.14 | 1.62 | 0.7× |
+| 2 000 | 2.48 | 5.44 | 0.5× |
+| 5 000 | 6.92 | 25.27 | 0.3× |
+| 10 000 | 13.78 | 70.26 | 0.2× |
+| 20 000 | 39.33 | 244.57 | 0.2× |
+
+**Rapier is 2–3× faster for circles at moderate counts and then falls off a
+cliff; for boxes it is 2–5× slower than matter-js at every count.** That is the
+opposite of the published native benchmarks (0.5 µs/body, 20× cheaper), and it
+kills the port: we would trade a week of work for a wash on circles and a
+regression on the boxes the toy is full of. Add the 3.4 MB WASM payload and the
+JS↔WASM boundary on top and it is not close.
+
+The likely reasons, for the record: the JS bindings ship a single-threaded,
+non-SIMD WASM build; the native numbers assume the parallel solver; and a 2D
+box stack is exactly the case where matter's warm-started contact solver does
+well.
+
+### The measurement that actually matters: drawing
+
+| bodies | canvas2d `drawImage` per body | one instanced draw call |
+|---:|---:|---:|
+| 5 000 | 8.16 ms | **0.34 ms** |
+| 10 000 | 17.11 ms | **0.38 ms** |
+| 20 000 | 29.65 ms | **0.51 ms** |
+| 50 000 | — | **0.86 ms** |
+
+**58× at 20,000 bodies, and it is flat.** (Measured through SwiftShader, i.e.
+software GL — a real GPU is faster still.)
+
+This reframes everything: at 20k bodies the *renderer* was eating 30 ms of a
+16.7 ms budget and the engine was being blamed for it. With instancing, 20k
+bodies cost half a millisecond to draw, and the whole budget belongs to physics.
 
 ---
 
-## 8. The honest answer to "tens of thousands at 60 Hz"
+## 8. Roadmap
 
-**Rigid bodies: no.** Not in matter-js, not in planck.js, and not in Rapier or
-Box2D v3 either — the best WASM engine lands at single-digit thousands of
-*simultaneously moving* rigid bodies in a browser, and the numbers people quote
-above that are native, multi-threaded, or mostly asleep.
+Ordered by (win ÷ cost), revised after §7. Effort: S ≈ hours, M ≈ days,
+L ≈ a week+.
 
-**Bodies: yes, with the split model.** Two layers, one canvas:
+| # | change | cost | win | status |
+|---|---|---|---|---|
+| 1 | **WebGL2 instanced renderer** | M | draws 58× at 20k; makes any body count possible | todo |
+| 2 | **Granular layer as a real toy** (sand/dust/water, cohesion) | M | 5–12× per body for circles | prototype |
+| 3 | Matter circle fast path in `Collision.collides` | S | 1.8–2.5× on the rigid step | todo |
+| 4 | `enableSleeping` for settled scenes + islands | S | large when the box is idle | not wired |
+| 5 | Ropes/chains/explosives on Matter constraints + impulses | S | none — pure capability | todo |
+| 6 | Worker + `SharedArrayBuffer` + interpolation | M | +16.7 ms budget, no jank | todo |
+| 7 | Own SoA rigid solver (convex polys + circles + joints) | L | 3–5× over matter on rigid | not started |
+| 8 | ~~Rapier2D port~~ | — | **ruled out by measurement** | — |
 
-1. **Rigid layer** — blocks, ramps, belts, anything that must rotate or stack.
-   Hundreds of bodies. Matter today, Rapier when it hurts.
-2. **Granular layer** — balls, shards, sand. Tens of thousands, no rotation,
-   drawn as blits (and later as one instanced draw call).
+Notes:
 
-That is not a compromise invented here: it is what falling-sand games
-(the extreme case — 90,000 cells at 60 fps in Sandspiel
-([write-up](https://maxbittker.com/making-sandspiel))) and every large-scale
-2D sim does. The toy box is already half-way there: balls do not visually
-rotate, so a granular ball is indistinguishable from a rigid one until it has to
-push a lever.
+- **(1) is the unlock, and it is not optional.** With the renderer at 0.5 ms, a
+  10k-body box needs only ~16 ms of physics; today's canvas costs 17 ms before
+  physics starts. Everything else in this table is secondary to it.
+- **(2) is what the user actually asked for** — a body that is *not* a rigid
+  body: thousands of grains that look like sand or water. The prototype already
+  does 10k in 12.5 ms; cohesion (a small attractive term between neighbours) and
+  two relaxation passes instead of three are the remaining tuning.
+- **(3)** is ~80 lines and a test. Do it when the rigid path matters again.
+- **(6)** buys no speed, it buys a frame of headroom. Requires cross-origin
+  isolation headers on the Caddy side ([MDN SAB](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/SharedArrayBuffer)).
+- **(7)** is only worth it if rigid *polygons* ever need to go past a couple of
+  thousand. Until then matter is fine at that scale and it already does ropes,
+  belts, stacks and shattering.
 
-Concretely, the path to a 30k-body box at 60 Hz:
+---
 
-- granular layer for balls/shards (done, prototype) → 10k physics in ~12 ms
-- one instanced draw call instead of 10k `drawImage`s → draw ~2 ms
-- worker + SAB so the 18 ms step runs at 30 Hz while the screen renders at 60
-- rigid toys stay on the current engine, a few hundred of them is nothing
+## 9. Verdict
 
-The first two are a week of work; the third is another. That gets a *sandbox*
-that holds tens of thousands of bodies, without pretending they are all
-simulated rigid bodies with rotation and contact manifolds — because they
-cannot be.
+**Tens of thousands of *bodies* at 60 Hz: yes. Tens of thousands of *rigid
+bodies*: no — and no engine change is needed to know that.**
+
+The measured budget at 60 Hz is 16.7 ms:
+
+| workload | physics | draw (instanced) | total |
+|---|---:|---:|---:|
+| 1 000 matter balls | 4.1 ms | 0.1 ms | 4.2 ms |
+| 10 000 matter boxes | 13.8 ms | 0.4 ms | 14.2 ms ✅ |
+| 10 000 grains | 12.5 ms | 0.4 ms | 12.9 ms ✅ |
+| 20 000 grains | 29.6 ms | 0.5 ms | 30.1 ms ✗ |
+| 20 000 matter circles | 176 ms | 0.5 ms | 176 ms ✗ |
+
+So the honest ceiling right now is **~10,000 dynamic bodies at 60 Hz** — as
+grains or as settled boxes — and the two things standing between that and 20k
+are solver cost, not rendering and not the engine brand:
+
+- fewer relaxation passes / fewer solver iterations (quality trade)
+- skipping bodies that are at rest (islands, sleeping)
+- a worker so a 20 ms step can run at 50 Hz while the screen stays at 60
+
+And for the toy box specifically, the split that makes sense is the one the
+numbers describe:
+
+1. **Rigid layer** (matter today): boxes, ramps, belts, ropes, note blocks,
+   explosives. Hundreds to a couple of thousand. It rotates, stacks and
+   shatters properly, and it is not the bottleneck.
+2. **Granular layer** (own solver): balls, sand, water, shards. Tens of
+   thousands. No rotation — which the renderer never showed anyway — with
+   cohesion, jetting and drag on top for liquids.
+3. **One renderer** for both: instanced circles, batched polygons, 0.5 ms at 20k.
+
+That combination is what "the same quality but much faster" looks like here, and
+every step of it is now measured rather than assumed.
+
