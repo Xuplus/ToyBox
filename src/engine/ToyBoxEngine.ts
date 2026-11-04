@@ -1,7 +1,9 @@
 import Matter from 'matter-js';
 import type { Synth } from '../audio/synth';
+import { FrameMeter } from '../lib/frame-meter';
 import { carryBodies } from '../physics/conveyor';
 import { shardGrid, shardLayout } from '../physics/shatter';
+import { planEmissions } from '../physics/spawner';
 import { clampIntoBounds, createWorld, removeBody, resizeWorld, STEP_MS } from '../physics/world';
 import { toyById } from '../toys/catalog';
 import { isShard, metaOf, setMeta } from '../toys/meta';
@@ -10,12 +12,35 @@ import { buildGrid, renderScene, type Ghost } from './render';
 
 export type Tool = 'drag' | 'delete' | ToyId;
 
-/** Hard cap on bodies. Shatter storms are the only way to approach it. */
-const MAX_BODIES = 280;
+/** Hard cap on bodies. A spawner nobody turns off is the only realistic way to
+ *  get here; the measured frame cost at 2000 bodies is roughly 40 fps on a
+ *  60 Hz display, which is slow but still interactive, so the tab survives. */
+const MAX_BODIES = 2000;
 /** Impact speed (px/step) below which a note block stays quiet. */
 const NOTE_THRESHOLD = 1.2;
 /** Minimum gap between two sounds from the same block, in ms. */
 const NOTE_COOLDOWN = 70;
+/** How often the FPS readout is pushed to React, in ms. Fast enough to feel
+ *  live, slow enough that the readout can't become part of the problem. */
+const STAT_EVERY = 250;
+/** Playfield multipliers offered by the size control (world px per css px). */
+export const PLAYFIELD_SIZES = [1, 1.5, 2, 2.5] as const;
+
+/** A snapshot of what the box is costing, pushed to the UI a few times a second. */
+export interface PerfStats {
+  /** frames per second at the median frame time */
+  fps: number;
+  /** the slow tail: fps at the 95th percentile frame */
+  fpsLow: number;
+  /** mean wall-clock frame time in ms, idle wait for vsync included */
+  frameMs: number;
+  /** mean main-thread cost of the physics steps in a frame, ms */
+  physicsMs: number;
+  /** mean main-thread cost of one canvas redraw, ms */
+  drawMs: number;
+  bodies: number;
+  toys: number;
+}
 
 export interface EngineCallbacks {
   /** Fired when the toy count changes. `toys` excludes shards, `bodies` is
@@ -23,6 +48,8 @@ export interface EngineCallbacks {
   onCount: (toys: number, bodies: number) => void;
   /** Fired on the first user gesture — used to dismiss the hint. */
   onFirstInteraction: () => void;
+  /** Fired every `STAT_EVERY` ms with the performance readout. */
+  onStats: (stats: PerfStats) => void;
 }
 
 interface DragState {
@@ -42,6 +69,11 @@ export class ToyBoxEngine {
   private pointer: Matter.Vector = { x: 0, y: 0 };
   private pointerInside = false;
   private cursor = '';
+  /** css size of the canvas */
+  private view = { w: 1, h: 1 };
+  /** world px per css px — the playfield control zooms the box, not the canvas */
+  private scale = 1;
+  /** simulated box size, `view * scale` */
   private size = { w: 1, h: 1 };
   private grid: Path2D | null = null;
   private time = 0;
@@ -51,6 +83,10 @@ export class ToyBoxEngine {
   private noteCounter = 0;
   private seeded = false;
   private destroyed = false;
+  private readonly meter = new FrameMeter();
+  private physicsMs = 0;
+  private drawMs = 0;
+  private statAcc = 0;
 
   constructor(
     private readonly canvas: HTMLCanvasElement,
@@ -96,17 +132,60 @@ export class ToyBoxEngine {
   }
 
   resize(width: number, height: number): void {
-    const w = Math.max(1, Math.round(width));
-    const h = Math.max(1, Math.round(height));
+    this.view = {
+      w: Math.max(1, Math.round(width)),
+      h: Math.max(1, Math.round(height)),
+    };
+    this.applyScale();
+  }
+
+  /**
+   * How many world pixels fit in one css pixel. 1 is the default; 2.5 gives a
+   * box two and a half times as wide and tall in the same space on screen, so
+   * there is room for a lot more stuff before it piles up.
+   */
+  setScale(scale: number): void {
+    const next = Math.min(Math.max(scale, 0.5), 4);
+    if (next === this.scale) return;
+    this.scale = next;
+    this.applyScale();
+  }
+
+  get playfieldScale(): number {
+    return this.scale;
+  }
+
+  /** Simulated box size in world px. */
+  get bounds(): { w: number; h: number } {
+    return { w: this.size.w, h: this.size.h };
+  }
+
+  /** Debug/benchmark helper: drop one toy at a world coordinate. */
+  placeToy(id: ToyId, x: number, y: number): void {
+    const toy = toyById(id);
+    if (toy) this.spawn(toy, { x, y });
+  }
+
+  /** Re-derive the backing store, the world size and the walls from `view`+`scale`. */
+  private applyScale(): void {
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const { w, h } = this.view;
 
     this.canvas.width = Math.round(w * dpr);
     this.canvas.height = Math.round(h * dpr);
-    this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
-    this.size = { w, h };
-    this.grid = buildGrid(w, h);
-    resizeWorld(this.world, w, h);
+    // One transform for everything: drawing code only ever thinks in world px,
+    // and the zoom (plus the device pixel ratio) is folded in here.
+    const k = dpr / this.scale;
+    this.ctx.setTransform(k, 0, 0, k, 0, 0);
+
+    const worldW = Math.max(1, Math.round(w * this.scale));
+    const worldH = Math.max(1, Math.round(h * this.scale));
+    if (worldW === this.size.w && worldH === this.size.h) return;
+
+    this.size = { w: worldW, h: worldH };
+    this.grid = buildGrid(worldW, worldH);
+    resizeWorld(this.world, worldW, worldH);
   }
 
   // --- public controls ---------------------------------------------------
@@ -129,6 +208,11 @@ export class ToyBoxEngine {
     for (const body of [...this.bodies]) this.remove(body);
     this.noteCounter = 0;
     this.emitCount();
+  }
+
+  /** Suppress the starter scene — a benchmark wants a known box. */
+  skipSeed(): void {
+    this.seeded = true;
   }
 
   /** A small starter scene, so the box is never a cold empty page. */
@@ -162,9 +246,16 @@ export class ToyBoxEngine {
     if (this.destroyed) return;
     this.raf = requestAnimationFrame(this.loop);
 
-    const dt = Math.min(now - this.last, 100);
+    const raw = now - this.last;
     this.last = now;
+
+    // The meter sees the real frame delta; the simulation only ever sees a
+    // clamped one, so a stall (or a hidden tab) can't teleport the bodies.
+    this.meter.push(raw);
+    const dt = Math.min(raw, 100);
     this.time += dt;
+
+    const started = performance.now();
 
     if (!this.paused) {
       this.acc = Math.min(this.acc + dt, STEP_MS * 5);
@@ -174,13 +265,68 @@ export class ToyBoxEngine {
       }
     }
 
+    const stepped = performance.now();
     this.draw();
+    const drawn = performance.now();
+
+    // EMAs: the readout should show a trend, not one unlucky frame.
+    this.physicsMs += (stepped - started - this.physicsMs) * 0.1;
+    this.drawMs += (drawn - stepped - this.drawMs) * 0.1;
+
+    this.statAcc += raw;
+    if (this.statAcc >= STAT_EVERY) {
+      this.statAcc = 0;
+      this.callbacks.onStats(this.stats());
+    }
   };
 
   private step(): void {
+    this.spawnFromSpawners(STEP_MS);
     carryBodies(this.bodies);
     Matter.Engine.update(this.world.engine, STEP_MS);
     this.evictEscaped();
+  }
+
+  /**
+   * Release whatever the spawners owe this step.
+   *
+   * The emissions are collected first and placed afterwards: placing a body can
+   * evict another one, and splicing `this.bodies` while iterating it would make
+   * the loop skip a spawner.
+   */
+  private spawnFromSpawners(dt: number): void {
+    let due: { toy: ToyDef; x: number; y: number; speed: number; spread: number }[] | null = null;
+
+    for (const body of this.bodies) {
+      const spec = metaOf(body)?.spawner;
+      if (!spec) continue;
+
+      spec.acc += dt;
+      const plan = planEmissions(spec.acc, spec.rateMs);
+      spec.acc = plan.carry;
+      if (plan.count === 0) continue;
+
+      const toy = toyById(spec.toy);
+      if (!toy) continue;
+
+      // Just below the mouth of the spout, clear of its own collision box.
+      const y = body.position.y + (body.bounds.max.y - body.position.y) + toy.w / 2 + 2;
+      for (let i = 0; i < plan.count; i++) {
+        (due ??= []).push({ toy, x: body.position.x, y, speed: spec.speed, spread: spec.spread });
+      }
+    }
+
+    if (!due) return;
+
+    for (const item of due) {
+      this.place(
+        item.toy,
+        { x: item.x, y: item.y },
+        { x: (Math.random() - 0.5) * item.spread, y: item.speed },
+      );
+    }
+
+    this.emitCount();
   }
 
   private evictEscaped(): void {
@@ -305,15 +451,69 @@ export class ToyBoxEngine {
   }
 
   private spawn(toy: ToyDef, at: Matter.Vector): void {
+    this.place(toy, at);
+    this.emitCount();
+  }
+
+  /** Build a toy and add its bodies. No count callback — see `spawn`. */
+  private place(toy: ToyDef, at: Matter.Vector, velocity?: Matter.Vector): void {
     const built = toy.build(at.x, at.y, { noteIndex: this.noteCounter++ });
     const bodies = Array.isArray(built) ? built : [built];
 
     for (const body of bodies) {
       clampIntoBounds(body, this.size.w, this.size.h);
+      if (velocity) Matter.Body.setVelocity(body, velocity);
       this.add(body);
+    }
+  }
+
+  /**
+   * Benchmark helper, reachable only through `?bench=N`: lay `n` bouncy balls
+   * over the box in a loose grid. Not used by the toy itself.
+   */
+  fill(n: number): void {
+    const toy = toyById('ballBouncy');
+    if (!toy) return;
+
+    const { w, h } = this.size;
+    const total = Math.max(1, Math.floor(n));
+    const cols = Math.max(1, Math.round(Math.sqrt((total * w) / h)));
+    const rows = Math.max(1, Math.ceil(total / cols));
+    const cellW = w / cols;
+    // Keep the top tenth free, so nothing starts outside the box.
+    const cellH = (h * 0.9) / rows;
+
+    for (let i = 0; i < total; i++) {
+      this.place(toy, {
+        x: (i % cols + 0.5) * cellW,
+        y: (Math.floor(i / cols) + 0.5) * cellH,
+      });
     }
 
     this.emitCount();
+  }
+
+  /** Current cost of the box: frame rate plus where the milliseconds go. */
+  stats(): PerfStats {
+    const frame = this.meter.snapshot();
+    let toys = 0;
+    for (const body of this.bodies) if (!isShard(body)) toys++;
+
+    return {
+      fps: frame.fps,
+      fpsLow: frame.fpsLow,
+      frameMs: frame.frameMs,
+      physicsMs: this.physicsMs,
+      drawMs: this.drawMs,
+      bodies: this.bodies.length,
+      toys,
+    };
+  }
+
+  /** Forget the timing window — call before measuring. */
+  resetStats(): void {
+    this.meter.reset();
+    this.statAcc = 0;
   }
 
   private emitCount(): void {
@@ -441,7 +641,11 @@ export class ToyBoxEngine {
 
   private toWorld(event: PointerEvent | MouseEvent): Matter.Vector {
     const rect = this.canvas.getBoundingClientRect();
-    return { x: event.clientX - rect.left, y: event.clientY - rect.top };
+    // rect-based rather than scale-based, so a canvas that CSS has resized
+    // behind our back still maps clicks onto the right place in the box.
+    const sx = this.size.w / Math.max(1, rect.width);
+    const sy = this.size.h / Math.max(1, rect.height);
+    return { x: (event.clientX - rect.left) * sx, y: (event.clientY - rect.top) * sy };
   }
 
   private updateCursor(point: Matter.Vector): void {
@@ -478,6 +682,7 @@ export class ToyBoxEngine {
       ghost: this.currentGhost(),
       grid: this.grid,
       draggingId: this.drag?.body.id ?? null,
+      scale: this.scale,
     });
   }
 

@@ -23,19 +23,21 @@ export interface RenderInput {
   ghost: Ghost | null;
   grid: Path2D | null;
   draggingId: number | null;
+  /** world px per css px; hairlines are widened by it so they survive a zoom-out */
+  scale: number;
 }
 
 export function renderScene(input: RenderInput): void {
-  const { ctx, width, height, grid } = input;
+  const { ctx, width, height, grid, scale } = input;
 
-  drawBackground(ctx, width, height, grid);
+  drawBackground(ctx, width, height, grid, scale);
 
   for (const body of input.bodies) {
     drawBody(ctx, body, input.time, body.id === input.draggingId);
   }
 
   if (input.ghost) drawGhost(ctx, input.ghost);
-  drawFrame(ctx, width, height);
+  drawFrame(ctx, width, height, scale);
 }
 
 /** Build the repeating grid path once per size change. */
@@ -57,6 +59,7 @@ function drawBackground(
   width: number,
   height: number,
   grid: Path2D | null,
+  scale: number,
 ): void {
   const gradient = ctx.createLinearGradient(0, 0, 0, height);
   gradient.addColorStop(0, '#141823');
@@ -67,12 +70,17 @@ function drawBackground(
 
   if (grid) {
     ctx.strokeStyle = 'rgba(255, 255, 255, 0.035)';
-    ctx.lineWidth = 1;
+    ctx.lineWidth = scale;
     ctx.stroke(grid);
   }
 }
 
-function drawFrame(ctx: CanvasRenderingContext2D, width: number, height: number): void {
+function drawFrame(
+  ctx: CanvasRenderingContext2D,
+  width: number,
+  height: number,
+  scale: number,
+): void {
   // Inner shadow along the bottom, so the floor reads as the bottom of a box.
   const shadow = ctx.createLinearGradient(0, height - 90, 0, height);
   shadow.addColorStop(0, 'rgba(0, 0, 0, 0)');
@@ -89,11 +97,11 @@ function drawFrame(ctx: CanvasRenderingContext2D, width: number, height: number)
   ctx.fillRect(0, height - 26, width, 26);
 
   ctx.fillStyle = 'rgba(255, 255, 255, 0.11)';
-  ctx.fillRect(0, height - 2, width, 2);
+  ctx.fillRect(0, height - 2 * scale, width, 2 * scale);
 
   ctx.strokeStyle = 'rgba(255, 255, 255, 0.07)';
-  ctx.lineWidth = 2;
-  ctx.strokeRect(1, 1, width - 2, height - 2);
+  ctx.lineWidth = 2 * scale;
+  ctx.strokeRect(scale, scale, width - 2 * scale, height - 2 * scale);
 }
 
 function roundedRect(
@@ -142,6 +150,10 @@ function drawBody(
     case 'note':
       ctx.rotate(body.angle);
       drawNote(ctx, meta, time);
+      break;
+    case 'spawner':
+      ctx.rotate(body.angle);
+      drawSpawner(ctx, meta, time);
       break;
     default:
       // Polygons are drawn from their world vertices, so no extra rotation.
@@ -359,6 +371,57 @@ function drawBelt(ctx: CanvasRenderingContext2D, meta: ToyMeta, time: number): v
     ctx.strokeStyle = alpha(meta.accent, 0.7);
     ctx.lineWidth = 1.5;
     ctx.stroke();
+  }
+}
+
+/** A little machine: housing, a mouth along the bottom edge, and three dots
+ *  falling through it once per emission interval. */
+function drawSpawner(ctx: CanvasRenderingContext2D, meta: ToyMeta, time: number): void {
+  const { w, h } = meta;
+  const radius = 8;
+  const spec = meta.spawner;
+
+  const fill = ctx.createLinearGradient(0, -h / 2, 0, h / 2);
+  fill.addColorStop(0, shade(meta.color, 0.34));
+  fill.addColorStop(1, shade(meta.color, -0.42));
+
+  roundedRect(ctx, -w / 2, -h / 2, w, h, radius);
+  ctx.fillStyle = fill;
+  ctx.fill();
+
+  ctx.strokeStyle = shade(meta.color, -0.6);
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+
+  ctx.strokeStyle = alpha(meta.accent, 0.5);
+  ctx.lineWidth = 1;
+  roundedRect(ctx, -w / 2 + 3, -h / 2 + 3, w - 6, h - 6, Math.max(1, radius - 2));
+  ctx.stroke();
+
+  // The mouth: a dark slot on the bottom edge, where the balls come out.
+  ctx.fillStyle = '#0a0d14';
+  roundedRect(ctx, -w * 0.28, h / 2 - 9, w * 0.56, 9, 4);
+  ctx.fill();
+
+  if (spec) {
+    const phase = (((time % spec.rateMs) + spec.rateMs) % spec.rateMs) / spec.rateMs;
+    ctx.fillStyle = alpha(meta.accent, 0.9);
+    for (let i = 0; i < 3; i++) {
+      const t = (phase + i / 3) % 1;
+      const y = -h * 0.2 + t * h * 0.6;
+      const r = 3.4 - t * 1.6;
+      ctx.beginPath();
+      ctx.arc(0, y, r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  // Two bolts, so it reads as a bolted-on machine rather than a block.
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.35)';
+  for (const side of [-1, 1]) {
+    ctx.beginPath();
+    ctx.arc(side * (w / 2 - 8), -h / 2 + 8, 2.4, 0, Math.PI * 2);
+    ctx.fill();
   }
 }
 

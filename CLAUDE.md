@@ -7,9 +7,13 @@ Context for AI agents working in this repo. Keep this file short; see
 
 A **2D physics sandbox**: a box you drop toys into and knock about. Balls with
 different weight and bounciness, blocks (some shatter on impact), conveyor
-belts, and musical blocks that play a note when something hits them. You can
-grab anything with the mouse and throw it. Nothing is stored and nothing is
-uploaded — the whole simulation runs on the device.
+belts, ball spouts that keep feeding the box, and musical blocks that play a note
+when something hits them. You can grab anything with the mouse and throw it.
+Nothing is stored and nothing is uploaded — the whole simulation runs on the
+device.
+
+The header shows a live **frame-rate readout** and a **playfield size** control
+(1×–2.5×) that zooms the world out, so more toys fit in the same screen space.
 
 Think Desktop Destroyer / The Incredible Machine as a toy shelf.
 
@@ -39,13 +43,19 @@ bundle served by Caddy**, and the `/toybox` prefix is baked into the build via
     spins circles so they roll).
   - `shatter.ts` — pure geometry: lay a grid of rotated shards over a broken
     body. Mutation lives in the engine.
+  - `spawner.ts` — pure emission schedule for the ball spout: how many balls are
+    owed this step, and what carries to the next one (burst-capped).
 - `src/toys/` — the **toy registry**. `catalog.ts` is the one file to edit to add
   a toy: each `ToyDef` knows its palette metadata and how to build its Matter
   body. `meta.ts` keeps per-body metadata (colour, belt speed, break threshold,
-  pitch) in a `WeakMap`.
+  pitch, spawner rate) in a `WeakMap`.
 - `src/engine/` — `ToyBoxEngine.ts` owns the RAF loop, pointer input
-  (spawn / drag / delete), collision handling (note strikes, shattering) and
-  body limits; `render.ts` is all the canvas 2D drawing.
+  (spawn / drag / delete), collision handling (note strikes, shattering), the
+  spawners, the playfield scale and body limits; `render.ts` is all the canvas 2D
+  drawing.
+- `src/lib/` — `frame-meter.ts` (rolling window of frame durations → fps, p95,
+  mean) and `color.ts` (shade/alpha). Pure, no DOM.
+- `src/debug.ts` — the `?bench=N` hook. Not part of the toy: see below.
 - `src/audio/` — `notes.ts` (scale + note naming, pure) and `synth.ts` (a tiny
   WebAudio synth — every sound is generated, no audio files).
 - `src/ui/` — `TopBar` (home, pause, mute, clear, language) and `Palette`.
@@ -57,8 +67,10 @@ bundle served by Caddy**, and the `/toybox` prefix is baked into the build via
 npm install
 npm run dev          # local dev (:5175)
 npm run typecheck
-npm run test         # vitest — physics/, toys/, audio/ pure logic
+npm run test         # vitest — physics/, toys/, audio/, lib/ pure logic
 npm run build        # tsc --noEmit + vite build → ./dist
+npm run bench -- --url http://127.0.0.1:4173/ --sizes 0,500,1000
+                     # headless frame-rate measurement, see PLAN.md §9
 ```
 
 Always run `npm run typecheck` and `npm run test` after changes.
@@ -78,8 +90,21 @@ Always run `npm run typecheck` and `npm run test` after changes.
   called from the first `pointerdown`. Never construct it at module load.
 - **Matter units are px per step**, not px per second. Fall speeds are ~10–20,
   so break thresholds and thresholds like `NOTE_THRESHOLD` are in those units.
-- **Bodies are capped** (`MAX_BODIES`) so a shatter storm can't lock up the tab;
-  the oldest dynamic body is evicted first.
+- **Bodies are capped** (`MAX_BODIES`, currently 2000) so a forgotten spawner or
+  a shatter storm can't lock up the tab; the oldest dynamic body is evicted
+  first. The cap is set just above where the frame budget breaks (see
+  `PLAN.md §9`) — raising it is a deliberate decision, not a knob.
+- **Measure, don't guess.** The readout is fed by `FrameMeter` and pushed to
+  React at most every 250 ms (`STAT_EVERY`); never put a per-frame `setState`
+  in the loop. Timing (`physicsMs`, `drawMs`) is an EMA over frames.
+- **The playfield scale is a transform, not a resize.** `setScale` changes
+  world-px-per-css-px and rebuilds the walls (`resizeWorld` clamps whatever is
+  now outside); the canvas element itself never changes size, so the
+  `ResizeObserver` in `App` stays quiet. Drawing code stays in world
+  coordinates — only `toWorld()` and `applyScale()` know about the zoom.
+- **`?bench=N` is a benchmark switch, not a feature.** It lives in
+  `src/debug.ts`, adds `window.__toybox`, and must stay invisible without the
+  query parameter. Never call it from product code.
 - **Shared header UX.** Top bar in normal flow — home (`🏠`, `href="/"` → the
   `elnuevos.es` root) + `🧰` title on the left, controls and language on the
   right. Never absolutely positioned. Mirrors the sibling games.
@@ -90,9 +115,9 @@ Always run `npm run typecheck` and `npm run test` after changes.
 
 ## Adding a toy
 
-1. Add an entry in `src/toys/catalog.ts` (`makeBall` / `makeBlock` / `makeBelt`
-   cover the current shapes) and add it to a `PALETTE_GROUPS` list. A
-   non-rectangular body sets `shape: 'poly'` on its metadata and is drawn from
+1. Add an entry in `src/toys/catalog.ts` (`makeBall` / `makeBlock` / `makeBelt` /
+   `makeSpawner` cover the current shapes) and add it to a `PALETTE_GROUPS` list.
+   A non-rectangular body sets `shape: 'poly'` on its metadata and is drawn from
    its Matter vertices (see `ramp`).
 2. Add its `toy_<id>` name to both dictionaries in `src/i18n.ts`.
 3. Add a test in `src/toys/catalog.test.ts` only if it behaves unusually (the
@@ -102,9 +127,13 @@ Always run `npm run typecheck` and `npm run test` after changes.
 
 Working: gravity, dragging/throwing with a soft constraint, spawning by click,
 delete tool and right-click delete, four balls, five blocks (including a static
-wedge ramp), breakable glass and brick, two conveyor belts, pitched note blocks
-(C major pentatonic, cycling), pause, mute, clear, EN/ES, responsive layout with
-a scrollable palette.
+wedge ramp), breakable glass and brick, two conveyor belts, a ball spout, pitched
+note blocks (C major pentatonic, cycling), pause, mute, clear, EN/ES, responsive
+palette, a live FPS/bodies readout, and the playfield size control.
+
+Performance is measured, not estimated: `PLAN.md §9` has the body-count curves
+and `npm run bench` reproduces them. The short version: 60 fps holds to ~1350
+bodies in a 1416×672 box, and the physics step — not the painter — is the wall.
 
 Ideas still open (see `PLAN.md §8`): saving a scene in `localStorage`, a
 "shake" button, funnels/dominoes as extra toy families, a sound-block octave

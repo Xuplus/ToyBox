@@ -2,7 +2,9 @@
 
 A box of little physics toys. Drop in balls with different weight and bounce,
 stack crates, shatter glass, ride conveyor belts, and knock out a tune on the
-musical blocks. Drag anything, throw it, watch what happens.
+musical blocks. Drag anything, throw it, watch what happens. A ball spout keeps
+filling the box on its own, and the playfield can be zoomed out up to 2.5× when
+you want to fit more in.
 
 It runs entirely in the browser — no server, no accounts, nothing stored, no
 image or sound files (the audio is synthesised).
@@ -22,9 +24,27 @@ npm run dev        # http://localhost:5175
 
 ```bash
 npm run typecheck
-npm run test       # vitest: physics, toy catalog, note maths
+npm run test       # vitest: physics, toy catalog, note maths, frame meter
 npm run build      # outputs ./dist
 ```
+
+## Performance
+
+The frame rate is on screen (bottom-left), and `npm run bench` drives the built
+app in a headless browser to measure the same thing without a human watching:
+
+```bash
+npm run build
+npx vite preview --port 4173 &
+npm run bench -- --url http://127.0.0.1:4173/ --sizes 0,500,1000,1500,2000
+npm run bench -- --url http://127.0.0.1:4173/ --spawners 6 --seconds 80
+```
+
+Roughly: **it holds 60 fps up to ~1350 bodies** in a 1416×672 box, and physics
+is what costs — the canvas redraw of 1000 balls is about a third of the frame.
+Six spouts take about a minute to fill the box that far. The numbers, the method
+and the caveats (headless has no vsync; measured at 1× pixel density) are in
+[`PLAN.md` §9](./PLAN.md#9-performance--measured-not-guessed).
 
 ## Add a toy
 

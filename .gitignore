@@ -9,3 +9,5 @@ package-lock.json
 *.tsbuildinfo
 vite.config.ts.timestamp-*
 .npm-cache
+# Local benchmark screenshots.
+.shots

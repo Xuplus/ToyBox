@@ -1,9 +1,17 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Synth } from './audio/synth';
-import { ToyBoxEngine, type Tool } from './engine/ToyBoxEngine';
+import { installBenchHook } from './debug';
+import { ToyBoxEngine, type PerfStats, type Tool } from './engine/ToyBoxEngine';
 import { STRINGS, detectLang, format, type Lang } from './i18n';
 import { Palette } from './ui/Palette';
 import { TopBar } from './ui/TopBar';
+
+/** Colour the FPS readout by how far it is from smooth. */
+function fpsTone(fps: number): string {
+  if (fps >= 55) return 'perf';
+  if (fps >= 30) return 'perf warn';
+  return 'perf bad';
+}
 
 export default function App() {
   const [lang, setLang] = useState<Lang>(detectLang);
@@ -11,6 +19,8 @@ export default function App() {
   const [paused, setPaused] = useState(false);
   const [muted, setMuted] = useState(false);
   const [count, setCount] = useState({ toys: 0, bodies: 0 });
+  const [perf, setPerf] = useState<PerfStats | null>(null);
+  const [scale, setScale] = useState(1);
   const [hint, setHint] = useState(true);
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -26,6 +36,7 @@ export default function App() {
     const engine = new ToyBoxEngine(canvas, new Synth(), {
       onCount: (toys, bodies) => setCount({ toys, bodies }),
       onFirstInteraction: () => setHint(false),
+      onStats: (next) => setPerf(next),
     });
     engineRef.current = engine;
 
@@ -44,6 +55,7 @@ export default function App() {
     observer.observe(canvas);
     measure();
     engine.start();
+    installBenchHook(engine);
 
     return () => {
       observer.disconnect();
@@ -82,6 +94,10 @@ export default function App() {
   const togglePause = useCallback(() => setPaused((value) => !value), []);
   const toggleMute = useCallback(() => setMuted((value) => !value), []);
   const toggleLang = useCallback(() => setLang((value) => (value === 'en' ? 'es' : 'en')), []);
+  const changeScale = useCallback((next: number) => {
+    setScale(next);
+    engineRef.current?.setScale(next);
+  }, []);
   const clear = useCallback(() => {
     engineRef.current?.clear();
     setHint(false);
@@ -98,6 +114,8 @@ export default function App() {
         muted={muted}
         onToggleMute={toggleMute}
         onClear={clear}
+        scale={scale}
+        onScale={changeScale}
       />
 
       <main className="stage">
@@ -110,6 +128,17 @@ export default function App() {
           <div className="empty">
             <strong>{t.empty}</strong>
             <span>{t.emptyHint}</span>
+          </div>
+        )}
+
+        {perf && (
+          <div
+            className={fpsTone(perf.fps)}
+            title={`${perf.fps.toFixed(0)} fps · ${perf.frameMs.toFixed(1)} ms · ${t.perfSim} ${perf.physicsMs.toFixed(1)} ms · ${t.perfDraw} ${perf.drawMs.toFixed(1)} ms`}
+          >
+            <span className="perf-fps">{perf.fps.toFixed(0)}</span> {t.fps}
+            <span className="perf-sep">·</span>
+            {format(t.bodies, { n: perf.bodies })}
           </div>
         )}
 

@@ -195,7 +195,8 @@ exercise them in plain Node. Canvas and pointer code lives only in `engine/`.
 **Done.** Gravity, spawning with a ghost preview, constrained dragging and
 throwing, delete tool and right-click delete, four balls, five blocks (including
 a static wedge ramp), glass and brick shattering, two belts, pitched note blocks,
-pause, mute, clear, EN/ES, responsive layout, starter scene, body cap.
+a ball spout, pause, mute, clear, EN/ES, responsive layout, starter scene, body
+cap, a live FPS readout, and a playfield size control (1×–2.5×).
 
 **Open / next:**
 
@@ -208,8 +209,82 @@ pause, mute, clear, EN/ES, responsive layout, starter scene, body cap.
 - Better touch affordances: currently a tap both selects and spawns; a
   tap-to-place-then-drag model may read better on a phone.
 - Sound-block octave shift so the shelf can play a bass line and a melody.
-- Perf pass if the cap is ever raised: cache gradients per toy colour instead of
-  building them per body per frame.
 - **Ship it**: add the card to `ElNuevos/src/games.ts` (`status: 'soon'` first),
   the `handle_path /toybox*` block to `ElNuevos/deploy/Caddyfile`, and the
   `Xuplus/ToyBox` entry to `deploy/webhook/deploy.config.json`.
+
+---
+
+## 9. Performance — measured, not guessed
+
+Two things shipped for this: a live readout (bottom-left, "62 FPS · 431
+bodies") and a **playfield size** control in the header that zooms the world
+out — `2.5×` means two and a half times as wide *and* tall in the same space on
+screen, so there is room for roughly six times as much stuff before it piles up.
+
+`scripts/bench.mjs` drives the built app in a headless browser over the DevTools
+protocol, so the numbers below can be reproduced without a human watching:
+
+```bash
+npm run build
+npx vite preview --port 4173 &
+npm run bench -- --url http://127.0.0.1:4173/ --sizes 0,500,1000,1500,2000
+npm run bench -- --url http://127.0.0.1:4173/ --spawners 6 --seconds 80
+```
+
+The bodies come from `?bench=N`, which empties the box, lays out N balls and
+exposes `window.__toybox` (see `src/debug.ts`). Without the parameter none of
+that exists.
+
+### Balls in the box — 1416×672 px, one playfield
+
+| bodies | fps | p95 fps | frame ms | physics ms | draw ms | 60 Hz est. |
+|-------:|----:|--------:|---------:|-----------:|--------:|-----------:|
+| 0 | 145 | 143 | 6.9 | 0.00 | 0.01 | 999 |
+| 250 | 145 | 143 | 6.9 | 0.70 | 1.17 | 348 |
+| 500 | 143 | 72 | 8.3 | 1.55 | 2.32 | 166 |
+| 750 | 72 | 71 | 12.1 | 4.29 | 3.28 | 119 |
+| 1000 | 72 | 48 | 16.0 | 7.72 | 4.14 | 75 |
+| 1250 | 48 | 36 | 22.1 | 13.46 | 5.11 | 63 |
+| 1500 | 29 | 21 | 34.9 | 27.52 | 6.52 | 51 |
+| 1750 | 13 | 12 | 74.8 | 65.07 | 7.19 | 47 |
+| 2000 | 10 | 10 | 95.4 | 84.19 | 9.63 | 42 |
+
+**The knee is around 1350 bodies.** Below it a 60 Hz display has room; above it
+the frame crosses the 16.7 ms budget and the simulation starts missing steps (the
+accumulator caps at five steps per frame, so past that the box runs in slow
+motion rather than spiralling).
+
+Reading the columns:
+
+- Headless has no vsync and its compositor ticks at ~145 Hz, so the raw `fps`
+  plateaus at 145 and is **not** the number to compare against 60. The
+  `60 Hz est.` column is: physics runs at a fixed 60 Hz regardless of frame rate,
+  so one step costs `fps × physics / 60`; a 60 Hz frame is one step plus one draw.
+- Physics is the wall, not the painter. The whole canvas redraw of 1000 balls
+  costs 4.1 ms; caching the per-ball gradients (the obvious renderer win, still
+  on the list above) would move the knee by a couple of hundred bodies at most.
+- A ball costs ~7 µs of physics per step at 1000 bodies and ~13 µs at 1500: the
+  cost per body *rises* once the box gets crowded, because contacts multiply.
+- Measured at device pixel ratio 1. On a HiDPI screen the canvas has four times
+  the pixels, so expect the draw share to roughly double and the knee to move
+  down a few hundred bodies.
+
+### Six ball spouts, letting it fill up
+
+Same box, a spout every 320 ms (18.75 balls/s):
+
+| t | bodies | fps | physics ms | draw ms | 60 Hz est. |
+|--:|-------:|----:|-----------:|--------:|-----------:|
+| 10 s | 192 | 145 | 0.34 | 0.98 | 558 |
+| 30 s | 564 | 143 | 2.66 | 2.58 | 112 |
+| 45 s | 846 | 72 | 6.10 | 4.30 | 86 |
+| 60 s | 1128 | 48 | 9.79 | 4.96 | 78 |
+| 65 s | 1224 | 48 | 13.60 | 5.11 | 62 |
+| 70 s | 1320 | 48 | 16.06 | 5.28 | 55 |
+| 80 s | 1506 | 36 | 29.55 | 6.99 | 40 |
+
+Which is the practical answer: **drop four to six spouts in and you get about a
+minute of smooth play, then the readout goes from green to amber to red over the
+next twenty seconds.** The body cap (2000) is what stops it there; clearing is
+one click.

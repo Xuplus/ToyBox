@@ -181,6 +181,49 @@ function makeRamp(): ToyDef {
   };
 }
 
+const SPAWNER_W = 78;
+const SPAWNER_H = 40;
+const SPAWNER_RATE = 320;
+const SPAWNER_COLOR = '#55657f';
+const SPAWNER_ACCENT = '#7fe0d0';
+
+/**
+ * A spout that keeps dropping bouncy balls. Static, so it stays where it is put
+ * (usually up near the ceiling); the engine owns the emission clock and the
+ * ball cap keeps a forgotten spawner from filling the box forever.
+ */
+function makeSpawner(): ToyDef {
+  return {
+    id: 'ballSpawner',
+    kind: 'spawner',
+    nameKey: 'toy_ballSpawner',
+    color: SPAWNER_COLOR,
+    accent: SPAWNER_ACCENT,
+    swatch: 'spawner',
+    w: SPAWNER_W,
+    h: SPAWNER_H,
+    build(x, y) {
+      const body = Matter.Bodies.rectangle(x, y, SPAWNER_W, SPAWNER_H, {
+        label: 'ballSpawner',
+        isStatic: true,
+        friction: 0.4,
+        frictionStatic: 0.6,
+        restitution: 0.1,
+      });
+
+      return setMeta(body, {
+        toyId: 'ballSpawner',
+        kind: 'spawner',
+        color: SPAWNER_COLOR,
+        accent: SPAWNER_ACCENT,
+        w: SPAWNER_W,
+        h: SPAWNER_H,
+        spawner: { rateMs: SPAWNER_RATE, toy: 'ballBouncy', speed: 1.5, spread: 1.2, acc: 0 },
+      });
+    },
+  };
+}
+
 const NOTE_W = 84;
 const NOTE_H = 28;
 
@@ -248,6 +291,8 @@ export const TOYS: ToyDef[] = [
   makeBelt('beltRight', 1, 'toy_beltRight'),
   makeBelt('beltLeft', -1, 'toy_beltLeft'),
 
+  makeSpawner(),
+
   noteBlock,
 ];
 
@@ -262,5 +307,6 @@ export const PALETTE_GROUPS: { titleKey: string; ids: ToyId[] }[] = [
   { titleKey: 'group_balls', ids: ['ballBouncy', 'ballMarble', 'ballHeavy', 'ballBeach'] },
   { titleKey: 'group_blocks', ids: ['crate', 'plank', 'ramp', 'glass', 'brick'] },
   { titleKey: 'group_belts', ids: ['beltRight', 'beltLeft'] },
+  { titleKey: 'group_spawners', ids: ['ballSpawner'] },
   { titleKey: 'group_music', ids: ['noteBlock'] },
 ];

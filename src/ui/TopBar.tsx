@@ -1,3 +1,4 @@
+import { PLAYFIELD_SIZES } from '../engine/ToyBoxEngine';
 import type { Dict, Lang } from '../i18n';
 
 export function TopBar({
@@ -9,6 +10,8 @@ export function TopBar({
   muted,
   onToggleMute,
   onClear,
+  scale,
+  onScale,
 }: {
   t: Dict;
   lang: Lang;
@@ -18,6 +21,8 @@ export function TopBar({
   muted: boolean;
   onToggleMute: () => void;
   onClear: () => void;
+  scale: number;
+  onScale: (scale: number) => void;
 }) {
   return (
     <header className="topbar">
@@ -33,6 +38,24 @@ export function TopBar({
       </div>
 
       <div className="actions">
+        <label className="field" title={t.playfield}>
+          <span className="field-icon" aria-hidden>
+            ⤢
+          </span>
+          <select
+            className="select"
+            aria-label={t.playfield}
+            value={scale}
+            onChange={(event) => onScale(Number(event.target.value))}
+          >
+            {PLAYFIELD_SIZES.map((size) => (
+              <option key={size} value={size}>
+                {size}×
+              </option>
+            ))}
+          </select>
+        </label>
+
         <button
           className={paused ? 'iconbtn on' : 'iconbtn'}
           onClick={onTogglePause}
