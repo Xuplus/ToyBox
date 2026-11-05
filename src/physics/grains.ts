@@ -226,6 +226,16 @@ const REST_WATER = 2;
  *  listed as a pair for the step: what the passes can close between them. */
 const CONTACT_MARGIN = 0.5;
 
+/**
+ * How far, in radii, a grain may sink into a *sleeping* neighbour before it is
+ * pushed out. The bottom of a deep bed goes to sleep still squeezed together by
+ * the weight above it; without this, a grain woken there resolves that old
+ * overlap against its frozen neighbours in one go, moves, wakes the next, and
+ * the bottom of the bed churns for ever (measured: 30 layers of r=3 sand kept
+ * 400-1100 grains awake). 0.15 settles every bed tried; 0.3 is too soft.
+ */
+const SLEEPER_SLOP = 0.15;
+
 /** Share of a body of water that must be still for all of it to sleep. The
  *  rest are drops wandering inside a pool that has stopped changing. */
 const POOL_STILL = 0.95;
@@ -1209,12 +1219,12 @@ export class GrainWorld {
    */
   private solveContacts(pass: number): void {
     const { x, y, vx, vy, kind, asleep, touched, supX, supY, pairI, pairJ } = this;
-    const { prevX, prevY } = this;
     const r = this.options.radius;
     const minDist = r * 2;
     const minDistSq = minDist * minDist;
     const maxPush = r * 1.2;
     const liquidPasses = 2;
+    const slop = r * SLEEPER_SLOP;
 
     for (let p = 0, pairs = this.pairCount; p < pairs; p++) {
       const i = pairI[p];
@@ -1250,7 +1260,8 @@ export class GrainWorld {
       const wsum = wi + wj;
 
       // Position: share the overlap by inverse mass. A sleeper is a wall.
-      const pen = Math.min(minDist - d, maxPush);
+      const pen = Math.min(minDist - d - (wj === 0 ? slop : 0), maxPush);
+      if (pen <= 0) continue;
       const pi = (pen * wi) / wsum;
       const pj = (pen * wj) / wsum;
       x[i] = xi - nx * pi;
@@ -1258,24 +1269,11 @@ export class GrainWorld {
       x[j] += nx * pj;
       y[j] += ny * pj;
 
-      // Friction on the correction too. The push-out is along the normal,
-      // so a grain on a slope that fell one gravity step and was pushed
-      // back out ends up a little way downhill: g*sin(slope) per step, a
-      // creep that no amount of velocity friction can see. Cancel the
-      // pair's tangential drift this step, if it is inside the cone.
-      const tx = -ny;
-      const ty = nx;
-      const muIJ = (MU[ki] + MU[kj]) * 0.5;
-      // (A sleeper has not moved this step, whatever its stale start says.)
-      const djx = wj === 0 ? 0 : x[j] - prevX[j];
-      const djy = wj === 0 ? 0 : y[j] - prevY[j];
-      const driftT = (djx - (x[i] - prevX[i])) * tx + (djy - (y[i] - prevY[i])) * ty;
-      // Static part only: a fast grain must not drag the surface along.
-      const stick = (Math.abs(driftT) <= muIJ * pen ? driftT : 0) / wsum;
-      x[i] += tx * stick * wi;
-      y[i] += ty * stick * wi;
-      x[j] -= tx * stick * wj;
-      y[j] -= ty * stick * wj;
+      // No friction on this correction: cancelling the pair's tangential
+      // drift here held a slope ~2 degrees steeper, and under the weight of
+      // a deep bed (pen large, so the cone wide) it shoved grains sideways
+      // every step - the bottom of an 80-layer bed never stopped moving.
+
       // Which way each was pushed: the direction it is held from. A
       // sleeper is not walked by `finish`, so it must not be marked.
       touched[i] = 1;
@@ -1294,6 +1292,9 @@ export class GrainWorld {
       // friction on the tangent, bounded by that impulse. Below the cone
       // the slip is cancelled outright: that is static friction, and it
       // is what holds a slope.
+      const tx = -ny;
+      const ty = nx;
+      const muIJ = (MU[ki] + MU[kj]) * 0.5;
       const e = -normalSpeed > BOUNCE_SPEED ? (BOUNCE[ki] + BOUNCE[kj]) * 0.5 : 0;
       const jn = (-(1 + e) * normalSpeed) / wsum;
       const slip = rvx * tx + rvy * ty;

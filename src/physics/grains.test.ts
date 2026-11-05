@@ -466,6 +466,25 @@ describe('GrainWorld - sand and water are different things', () => {
 });
 
 describe('GrainWorld - support', () => {
+  it('puts the bottom of a deep bed to sleep and keeps it there', () => {
+    // ~80 layers, what a full box at the 2.5x playfield holds. The bottom of a
+    // bed this deep used to churn for ever: friction on the position
+    // correction shoved grains sideways under the load, and a grain woken
+    // there resolved the overlap it fell asleep with against frozen
+    // neighbours in one go and woke the next.
+    const w = world(9000, 1000, 1400, 5);
+    let seed = 5;
+    const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+    for (let i = 0; i < 9000; i++) w.add(10 + rnd() * 980, 10 + rnd() * 980, 0, 0, GRAIN.sand);
+    run(w, 1500);
+    let most = 0;
+    for (let i = 0; i < 500; i++) {
+      w.step();
+      most = Math.max(most, w.awake);
+    }
+    expect(most).toBeLessThan(90); // 1%
+  });
+
   it('collapses the roof when a tunnel is dug under a sleeping heap', () => {
     const w = world(1200, 600, 300, 5);
     pour(w, 1200, 300);
