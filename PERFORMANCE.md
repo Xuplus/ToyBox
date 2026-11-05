@@ -26,13 +26,16 @@ depends on that, it says so.
   usually blames (the per-step `bodies.sort` is 0.7%).
 - Solver is 29%, broadphase 9%, integration 2%, rendering ~2%.
 - A typed-array granular solver does the same for piles of small round things in
-  **~0.5 µs per moving grain**, and it is now a first-class toy: sand and water
+  **~0.4 µs per moving grain**, and it is now a first-class toy: sand and water
   pour from hoppers, bury crates, ride belts, and **go to sleep when they
-  settle**, so 8,000 settled grains cost 0.24 ms - a twentieth of what the same
-  8,000 cost while they are still moving.
-- The wall for grains is *packing density*, not body count: past ~60% of the
-  box the contact graph is over-constrained, the pile never settles, and the
-  step time goes up an order of magnitude. The wall for rigid bodies is matter's
+  settle**, so 8,000 settled grains cost 0.2 ms - a sixteenth of what the same
+  8,000 cost while they are still falling.
+- Sand and water are two solvers on one grid: sand is Coulomb-friction contacts
+  (it heaps at ~33°), water is double-density relaxation (it runs and levels).
+  A grain sleeps only when it is *held up*, and wakes when what held it goes, so
+  nothing floats (§6).
+- At the toy's grain size the box itself is no longer a wall: a box 82% full of
+  sand settles to zero awake grains. The wall for rigid bodies is matter's
   9 µs/body. Neither is the renderer, which is the point.
 
 ---
@@ -171,45 +174,53 @@ wants a unit test against the SAT result rather than a quick patch at midnight.
 
 `src/physics/grains.ts` is a second, much smaller engine for the case that
 dominates: thousands of *circles*. Positions and velocities live in
-`Float32Array`s, a counting-sort uniform grid does broadphase in O(n), and 3
-Gauss-Seidel relaxation passes resolve contacts. No objects per body, no
-allocation per step, no rotation.
+`Float32Array`s, a counting-sort uniform grid does broadphase in O(n), and two
+solvers share that grid: sand finds its contacts once per step and runs 5
+Gauss-Seidel passes over them with Coulomb friction, water runs two Jacobi
+double-density relaxations over a stored neighbour list. No objects per body,
+no allocation per step, no rotation.
 
 Rotation is the thing it gives up - and the renderer never draws ball rotation
 anyway (`drawBall` uses a fixed gradient), so **for balls the result is visually
 identical**.
 
 It is now a toy, not a prototype: two materials (`MATERIALS` in the same file
-describes the colour, friction, restitution, cohesion and sleep behaviour of
-each), grains collide with every Matter body and leave a load behind (so sand
+describes the colour, friction, restitution, mass, support and sleep behaviour
+of each), grains collide with every Matter body and leave a load behind (so sand
 weighs a crate down and tips it if it is off centre), a conveyor's surface drift
 carries whatever rests on it, and a settled pile **sleeps**.
 
 ### The number that matters is *moving* grains, not grains
 
-Measured in the app (`?bench`, `box.grains(n)`), box 1416×606, `est-60hz`:
+`scatterGrains` into a 1416×606 box, Node (same V8 as Chrome), ms per step.
+"Falling" is the first second, "settled" is after 30 s. The previous solver
+(3 passes, position friction, sleep on stillness alone) for comparison:
 
-| grains | radius | state | step ms | µs/grain |
-|---:|---:|---|---:|---:|
-| 4 000 | 3 | all falling | 1.55 | 0.39 |
-| 8 000 | 3 | all falling | 4.86 | 0.61 |
-| 4 000 | 3 | settled | **0.10** | 0.03 |
-| 8 000 | 3 | settled | **0.29** | 0.04 |
-| 7 000 | 5 | 64% packed (a full box) | 4.2 | 0.6 |
+| grains | radius | material | falling, before → now | settled, before → now | awake at 30 s |
+|---:|---:|---|---:|---:|---:|
+| 4 000 | 3 | sand | 5.60 → **2.37** | 0.21 → **0.11** | 0 |
+| 8 000 | 3 | sand | 8.83 → **3.86** | 0.24 → **0.21** | 0 |
+| 7 000 | 5 | sand, 64% of the box | 9.60 → **5.97** | 0.21 → **0.15** | 0 |
+| 9 000 | 5 | sand, 82% of the box | - → 5.52 | - → **0.15** | 0 |
+| 2 000 | 5 | water | 2.29 → 2.57 | 0.07 → **0.04** | 0 |
+| 4 000 | 5 | water | 3.91 → **3.00** | 0.16 → **0.07** | 0 (13 before) |
 
 Three things fall out of that table:
 
-1. **Asleep grains are nearly free.** 8,000 settled grains cost 0.24 ms, because
-   after settling only ~80 of them are still moving: everything else is skipped,
-   and the only per-grain work left is the grid and the sleep window.
-2. **An awake grain is ~0.5 µs**, so 8,000 of them moving at once is 4.9 ms of a
-   16.7 ms budget. That is still 3-4× cheaper per body than matter's 9 µs, and
-   the awake count is what a scene should be judged on.
-3. **The ceiling is the box, not the solver.** Pack the same box to 64% and the
-   contact graph is over-constrained: the pile never comes to rest, so nothing
-   sleeps, and step time goes up an order of magnitude. At 90% packing (16,000
-   grains of r=3) it collapses to 136 ms/step. That is a box *full of sand*, and
-   no amount of tuning fixes it - the contact graph is over-constrained.
+1. **Asleep grains are nearly free.** 8,000 settled grains cost 0.2 ms: everything
+   asleep is skipped, and the only per-grain work left is the grid and the sleep
+   window.
+2. **An awake grain is ~0.4 µs** (sand, contacts found once and reused for all
+   five passes), so 8,000 of them falling at once is under 4 ms of a 16.7 ms
+   budget - more than twice as cheap as the old three-pass solver, which
+   re-searched the grid on every pass. That is 20× cheaper per body than
+   matter's 9 µs, and the awake count is what a scene should be judged on.
+3. **At r=5 the box is not a wall any more.** The old solver's position friction
+   kept the bottom of a deep bed shuffling sideways under its own weight; with it
+   gone, a box 82% full settles. What is left is radius-dependent: at r=3 (only
+   reachable through `?bench`) a bed ~50 layers deep keeps ~2,000 floor grains
+   cycling on probation at ~2.8 ms, because one step of gravity is a bigger
+   fraction of a small grain's radius. The toy's grains are r=5.
 
 ### What it costs in the toy
 
@@ -232,7 +243,7 @@ Two things had to be true before sleep could be invisible rather than a glitch:
   stops. Measured effect on a 240-grain heap: mean creep over 30 steps went from
   **8.3 px to 0.01 px**.
 - **Perfect circles roll for ever.** Real sand is angular. A contacted grain
-  below 1.5 px/step keeps `rolling` (0.9 for sand, 0.995 for water) of its
+  below 1.5 px/step keeps `rolling` (0.9 for sand, 1 - none - for water) of its
   speed per step. Measured effect on 8,000 grains settled in a wide box:
   **3,122 awake became 81**.
 
@@ -283,16 +294,71 @@ Measured, ball r=18 over a settled bed, `scripts/scenes/shake.js`:
 
 ### Sand and water are not the same material
 
-| | friction | cohesion | rolling | restitution | support | grip |
-|---|---:|---:|---:|---:|---:|---:|
-| sand | 0.22 | 0 | 0.90 | 0.10 | 1 | 0.05 |
-| water | 0.01 | 0.12 | 1.00 | 0.02 | 0 | 0.012 |
+They used to be: both were the same overlap-push solver with different
+friction and a cohesion term, so water was sand that slid. Now they are two
+solvers:
 
-Sand holds an angle of repose, stops rolling and holds a body up; water has
-almost no friction, enough cohesion to hold a surface, no rolling resistance and
-no support at all, so it runs, spreads and levels - and a ball dropped into it
-sinks through to the floor instead of resting on top. The two are visibly,
-measurably different materials, and the difference is that table.
+| | solver | friction | rolling | mass | support | grip |
+|---|---|---:|---:|---:|---:|---:|
+| sand | contacts, 5 Gauss-Seidel passes | 0.4 (Coulomb) | 0.90 | 1 | 1 | 0.05 |
+| water | double-density relaxation, 2 Jacobi passes | - | 1.00 | 0.15 | 0 | 0.012 |
+
+- **Sand** is a contact list with real Coulomb friction: the tangential impulse
+  is capped at μ times the normal one. That is what an angle of repose *is*, and
+  a pour now stands at ~32-35° (it was 44° and still climbing, because a
+  position-level "stick" term let a heap stand on nothing). Friction acts on
+  velocity only; friction on the position correction made the bottom of a deep
+  bed shuffle sideways for ever, and is gone.
+- **Water** is Clavet et al.'s double-density relaxation (2005): each drop
+  measures how crowded its neighbourhood is and the pair pushes apart or pulls
+  together to restore a rest density, with a near-density term so two drops
+  never merge. That is pressure and surface tension in one pass, so water runs
+  off a heap, levels in a box (surface spread over 2,000 poured drops: 64-203 px
+  before, **101-106 px** now) and holds a meniscus. Two Jacobi iterations at
+  `relax` 0.3: one was not stiff enough for the bottom of a pool 20 drops deep,
+  which boiled for ever; Gauss-Seidel in index order drove a current along the
+  floor. Both pinned in `grains.test.ts`.
+- **Water is light** (0.15) so seepage through a heap does not shove the sand,
+  and sand dropped into a pool goes to the bottom.
+
+### Sleep that wakes when it should
+
+The old rule put a grain to sleep when it had been still for a window. A grain
+can be still and unsupported - balanced on the shoulder of one neighbour, or the
+roof of a tunnel the eraser just dug - and once it slept nothing ever checked
+again, so it hung there: the floating sand.
+
+- **A grain sleeps only when it is held up.** `cradled()` is a friction-cone
+  test: the pushes from its neighbours, the floor and the walls must fan around
+  "up" within the friction angle. A grain perched on the outside of one
+  neighbour is still sliding and stays awake.
+- **A grain that moves marks its cell dirty**, and sleepers above dirty cells
+  are woken on probation (`wakeDirty`). The eraser and a dragged body wake their
+  surroundings with a margin (`wakeIn`). `audit()` re-checks a slice of
+  sleepers every step as a safety net.
+- **Water holds nothing up and sleeps a body at a time.** Sand resting only on
+  drops is flagged `REST_WATER` so moving water wakes it; dirt left by water
+  alone wakes only water. A drop never sleeps on its own: `settleLiquid()`
+  floods the cells holding awake water into connected bodies and sleeps a body
+  once 95% of it is quiet. Per-drop sleep never converged - a stopped drop is a
+  wall its neighbours jostle.
+
+Measured (Node, 1416×606, r=5):
+
+| scene | before | now |
+|---|---|---|
+| tunnel dug under a heap's flank | roof floats, 0 grains fall in | **24 grains** refill it |
+| 3,000 sand poured, ms/step while pouring | 1.44 | **0.77** |
+| 2,000 water poured, ms/step while pouring | 1.38 | **1.04** |
+| sand dropped into a 4,000-drop pool | stays on top | sinks, then 0 awake |
+| sand and water poured side by side (`pour-both.js`), after the pour | 0 awake at +15 s | 0 awake at +20 s |
+| 8,000 r=3 scattered, half sand half water | 0 awake at 13 s | 0 awake at 30 s |
+
+The last two rows are the honest cost. The old solver got quiet sooner because
+it froze grains wherever they happened to stop - which is the floating. Now the
+water stays awake while sand is still sinking through it and while it sloshes,
+and that is real motion: ~2.5-3 ms a step at 3,650 grains, ~12 ms at 8,000 fully
+interleaved r=3 grains, for those seconds. Then 0.07-0.2 ms.
 
 ### What it gives up, and why that is the right trade
 
@@ -470,24 +536,23 @@ L ≈ a week+.
 | # | change | cost | win | status |
 |---|---|---|---|---|
 | 1 | **WebGL2 instanced renderer** | M | draws 58× at 20k; makes any body count possible | **shipped** (§7) |
-| 2 | **Granular layer as a real toy** (sand + water, cohesion, rigid-body coupling, sleep) | M | 0.2 µs per *moving* grain, free once settled | **shipped** (§6) |
+| 2 | **Granular layer as a real toy** (Coulomb sand, double-density water, rigid-body coupling, support-based sleep) | M | ~0.4 µs per *moving* grain, free once settled | **shipped** (§6) |
 | 3 | Matter circle fast path in `Collision.collides` | S | 1.8–2.5× on the rigid step | todo |
 | 4 | `enableSleeping` for settled scenes + islands | S | large when the box is idle | not wired; the granular layer sleeps already |
 | 5 | Ropes/chains/explosives on Matter constraints + impulses | S | none — pure capability | todo |
 | 6 | Worker + `SharedArrayBuffer` + interpolation | M | +16.7 ms budget, no jank | todo |
 | 7 | Own SoA rigid solver (convex polys + circles + joints) | L | 3–5× over matter on rigid | not started |
 | 8 | ~~Rapier2D port~~ | — | **ruled out by measurement** | — |
-| 9 | **Density constraint (PBF) for sand and water** | M | pressure: buoyancy, bearing capacity, water that levels | prototype measured, see §6 |
+| 9 | **Density constraint (PBF) for sand and water** | M | pressure on *bodies*: buoyancy, bearing capacity | water levels already (double-density, §6); bodies still feel no pressure |
 
 Notes:
 
 - **(1) is done.** The painter now costs 0.06–0.5 ms whatever is in the box, so
   the frame budget is entirely physics. Everything below is about the solver.
 - **(2) is done.** Sand and water are in the palette, pour from hoppers, bury
-  crates, run down ramps, ride belts, and go to sleep when they settle. The
-  measured limit is now the *box*, not the solver: fill it past about 60%
-  packing and a grain pile can no longer converge, which is a property of the
-  material rather than of the code.
+  crates, run down ramps, ride belts, and go to sleep when they settle - and
+  wake when what held them up goes. A box 82% full of r=5 sand settles; the
+  remaining limit is a bed ~50 layers of the bench-only r=3 grain.
 - **(3)** is ~80 lines and a test. Do it when the rigid path matters again.
 - **(4)** now matters less: rigid toys are counted in dozens, and the granular
   layer has its own sleep. It becomes interesting when a big stack of planks
@@ -510,11 +575,11 @@ The measured budget at 60 Hz is 16.7 ms:
 | workload | physics | draw (instanced) | total |
 |---|---:|---:|---:|
 | 1 000 matter balls | 4.1 ms | 0.3 ms | 4.4 ms |
-| 8 000 grains, all moving | 4.9 ms | 0.2 ms | 5.1 ms |
-| 8 000 grains, settled | 0.24 ms | 0.2 ms | 0.44 ms |
+| 8 000 grains, all moving | 3.9 ms | 0.2 ms | 4.1 ms |
+| 8 000 grains, settled | 0.21 ms | 0.2 ms | 0.41 ms |
 | 10 000 matter boxes | 13.8 ms | 0.4 ms | 14.2 ms |
-| 7 000 grains at 64% packing | 4.2 ms | 0.1 ms | 4.3 ms |
-| 16 000 grains at 90% packing | 136 ms | 0.3 ms | 136 ms |
+| 7 000 grains at 64% packing, settled | 0.15 ms | 0.1 ms | 0.25 ms |
+| 12 000 r=3 grains, 50 layers deep | 2.8 ms | 0.3 ms | 3.1 ms |
 | 20 000 matter circles | 176 ms | 0.5 ms | 176 ms |
 
 So the honest picture is:
@@ -524,9 +589,9 @@ So the honest picture is:
   buys the thing the toy wants - sand you can pour, water you can spill, balls
   you can fill the box with.
 - **Rigid bodies**: ~2,000 at 60 Hz, because matter is 9 µs per polygon body.
-- **The wall for grains is packing density, not body count.** Past about 60%
-  of the box, contacts are over-constrained, the pile never settles, and the
-  cost goes up by an order of magnitude. It is a full box of sand at that point.
+- **The wall for grains is depth in grains, not body count.** At the toy's
+  r=5 a box 82% full settles; a bed ~50 layers of r=3 does not quite, and keeps
+  ~2,000 floor grains cycling (2.8 ms). Only `?bench` makes grains that small.
 
 And for the toy box specifically, the split that makes sense is the one the
 numbers describe:
@@ -536,7 +601,7 @@ numbers describe:
    shatters properly, and it is not the bottleneck.
 2. **Granular layer** (own solver): sand, water, and anything else that is
    really a pile of small round things. No rotation - which the renderer never
-   showed anyway - with cohesion and drag on top for liquids.
+   showed anyway - with a second, liquid solver on the same grid for water.
 3. **One renderer** for both: instanced circles, batched polygons, 0.1 ms at 20k
    - shipped, and no longer the reason anything is capped.
 

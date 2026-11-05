@@ -296,60 +296,83 @@ one click.
 
 ---
 
-## 10. Sand and water — what "good" would take
+## 10. Sand and water — what shipped, and what is still missing
 
-The granular layer is a **position relaxation**, not a fluid or a soil model. It
-has no notion of pressure, so it can only do two things: keep grains from
-overlapping, and let a body push them around. Everything the toy does with sand
-and water follows from that, including what looks wrong:
+The granular layer started as one **position relaxation** for both materials:
+keep grains from overlapping, let a body push them around, put a grain to sleep
+once it stops. Everything that looked wrong followed from that:
 
-| symptom | cause |
-|---|---|
-| a ball dropped on a pile shook the pile, then bounced out of it | the coupling was a force applied a step late; measured 10 px/step back out of a shallow pile, 702 out of a deep one |
-| the ball then sank slowly through sand (2 px/s) | the medium has no bearing capacity: only the grains physically under it push back |
-| sand and water both hold a heap; water does not level | no pressure, so a column of water has nothing pushing it sideways |
-| nothing floats | buoyancy *is* the pressure gradient |
+| symptom | cause | status |
+|---|---|---|
+| a ball dropped on a pile shook the pile, then bounced out of it | the coupling was a force applied a step late; measured 10 px/step back out of a shallow pile, 702 out of a deep one | **fixed** (P0) |
+| sand and water felt the same; water held a heap and did not level | one solver for both, with no pressure | **fixed** (P1) |
+| a heap stood at 44° and still climbing | position-level friction let a grain stand on nothing | **fixed** (P1) |
+| sand floated after what was under it moved away | sleep on stillness alone: a still grain is not necessarily a held one, and nothing re-checked a sleeper | **fixed** (P2) |
+| a ball sinks slowly through sand (2 px/s) | no bearing capacity: only the grains physically under it push back | open (P3) |
+| nothing floats | buoyancy *is* the pressure gradient on a body | open (P3) |
 
-### The plan
+### What shipped
 
-**P0 (shipped)** - the coupling is a contact constraint. It can take speed away
-from a body and carry its weight; it can never add speed. 10 px/step of bounce
-became 0.06, and a pile that stayed awake for ever now settles.
+**P0 - the coupling is a contact constraint.** It can take speed away from a
+body and carry its weight; it can never add speed. 10 px/step of bounce became
+0.06.
 
-**P1 - a density constraint (PBF, and XPBD for the contacts).** This is the single change that buys
-pressure, and pressure is all four symptoms above. Each particle accumulates the
-density of its neighbourhood and a constraint multiplier from it; the position
-correction comes from the *pressure* of the pair instead of from the overlap.
-Prototyped at 952 particles: 2.3 ms/step with viscosity, a lattice that holds its
-rest density exactly, and a dam break that levels from a 129 px surface spread to
-8 px. Buoyancy then comes out of the same correction - no extra model.
+**P1 - two solvers on one grid.** Sand is a contact list (found once per step,
+5 Gauss-Seidel passes) with velocity-level Coulomb friction, μ = 0.4: it heaps at
+32-35°. Water is Clavet-style double-density relaxation, two Jacobi iterations
+over a stored neighbour list: it runs off a heap and levels (surface spread of a
+2,000-drop pour: 64-203 px before, 101-106 px now). This is pressure *inside* the
+water; bodies still meet it through `dragImpulse`, so there is still no buoyancy.
 
-**P2 - sand as a frictional, yielding medium.** The same solver, plus
-(a) Coulomb friction on the tangential correction, limited by `mu` times the
-normal correction, and (b) a yield threshold: only correct once the compression
-exceeds a strain, which is what lets a pile stand at an angle of repose and then
-collapse when it is overloaded or dug into. That replaces `rolling` (a global
-speed clamp) with real shear strength.
+**P2 - sleep on support, wake on loss.** A grain sleeps only if `cradled()` -
+the pushes on it fan around "up" inside the friction cone. Moving grains dirty
+their cells and wake the sleepers above (`wakeDirty`); the eraser and a dragged
+body wake a margin around them; `audit()` re-checks a slice of sleepers each
+step. Water sleeps a connected body at a time (`settleLiquid`), and sand resting
+on water is flagged so moving water wakes it. A tunnel dug under a heap now
+refills (24 grains fell in; 0 before).
 
-**P3 - water as a surface, not a heap of discs.** The liquid draw path already
-fuses overlapping drops, but a dense pool still shows the lattice as texture, and
-poured water can still stand in a cone. With pressure in place, a puddle levels
-by itself; the draw path can then be a single surface (a metaball/marching-squares
-outline) instead of thousands of discs.
+Cost, Node, 1416×606: 8,000 r=3 sand falling 8.8 → 3.9 ms/step; a 3,000-grain
+sand pour 1.44 → 0.77; a 2,000-drop water pour 1.38 → 1.04; settled boxes
+0.04-0.21 ms. The price is that water now stays awake while it is really moving
+(sand sinking through it, a pool sloshing) instead of being frozen mid-wave.
+Tables in `PERFORMANCE.md` §6.
 
-**P4 - cost control.** 2,000 particles at 2.4 µs is 4.8 ms; two iterations, a
-half-stencil pair walk and sleeping the settled interior should bring the
-common case to ~2 ms, which is where water can be a toy rather than a stunt.
+### Tried and rejected (so nobody tries them again)
 
-### What this costs
+- **Shock propagation** (treat the grain below as infinitely heavy, solve bottom
+  up). It makes a heap stand at 50-60°, which
+  reads as wet sand, not dry.
+- **Friction on the position correction** ("stick"). Bought ~2° of slope; under
+  the weight of a deep bed it shoved grains sideways every step, and the bottom
+  of an 80-layer bed never stopped. Removed; friction is velocity-only.
+- **One liquid iteration with a bigger `relax`, or a longer reach.** The bottom
+  of a pool ~20 drops deep has more neighbours in its kernel than the surface,
+  so a relaxation stiff enough to hold the column overshoots there and it boils
+  for ever. Two iterations at 0.3 hold. Gauss-Seidel instead of Jacobi drives a
+  current along the floor in index order.
+- **Per-drop sleep for water.** A stopped drop is a wall its neighbours jostle;
+  it never converged. Water sleeps a whole connected body or none of it.
+- **Waking the sleepers a woken grain squeezes.** It cascades through a deep
+  bed. Contacts with a sleeper allow 0.15 r of overlap (`SLEEPER_SLOP`) instead.
+- **`wakeAll()` on a settled heap** slumps it a few degrees: every grain
+  re-solves its contacts from scratch at once. Wake locally instead.
+- **A worker for the grains alone.** The coupling to Matter has to see this
+  step's grains, or the support lags a frame and becomes the delayed spring P0
+  removed. A worker has to own both engines, or neither.
 
-- **Speed.** A density constraint is two neighbour passes per iteration instead
-  of one - measured 1.3–2.3 ms per 1,000 particles against 0.5 ms today. Water
-  and sand stop being free; the budget becomes "about 2,000 moving particles".
-- **Reach.** The solver has to become substep-based (2–4 substeps per 60 Hz tick)
-  for the constraint to be stiff without jitter. That is a rewrite of `step()`,
-  not a patch to it.
-- **Risk.** Everything that depends on the current sleep and contact rules -
-  conveyors carrying sand, the delete tool, the pour stream - has to be re-pinned
-  with tests. That is why P0 was done as a separate, shippable step.
+### Still open
 
+**P3 - pressure on bodies.** A density constraint the *bodies* take part in
+(PBF/XPBD, see the prototype in `PERFORMANCE.md` §6): bearing capacity for sand,
+buoyancy for water. It needs substeps (2-4 per tick) to stay stiff without
+jitter, so it is a rewrite of `step()`, and everything above has to be re-pinned
+with tests.
+
+**P4 - water as a surface.** The liquid draw path fuses overlapping drops, but a
+deep pool still shows its lattice as texture. A metaball / marching-squares
+outline would draw it as one body.
+
+**P5 - small grains in deep beds.** At r=3 (bench only) a bed ~50 layers deep
+keeps ~2,000 floor grains cycling on probation (2.8 ms). One gravity step is a
+bigger share of a small radius; substeps (P3) would fix this too.

@@ -189,6 +189,12 @@ Always run `npm run typecheck` and `npm run test` after changes.
   only to contacted grains slower than `ROLL_SPEED` and not riding a body, so a
   falling stream and sand on a belt are unaffected. The angle of repose comes
   from `friction` (Coulomb, 0.4 ≈ 32–38°), not from this.
+- **Sand friction is on velocity only.** Friction on the position correction
+  (a "stick" term) holds a steeper heap and makes the bottom of a deep bed
+  shuffle sideways under its own weight for ever, so it never sleeps. A contact
+  with a *sleeping* grain allows `SLEEPER_SLOP` (0.15 r) of overlap before it
+  pushes, so a grain woken under load does not undo its squeeze in one step and
+  wake the bed around it. Both are pinned by the deep-bed test.
 - **The coupling is a constraint, never a force.** `supportImpulse` and
   `dragImpulse` in `grains.ts` take speed *out of* a body along the contact
   normal and may carry its weight; they may never add speed. `holdFx/holdFy` is
@@ -239,12 +245,16 @@ responsive palette, a live FPS/bodies readout, and the playfield size control.
 Performance is measured, not estimated: `PERFORMANCE.md` has the curves and
 `npm run bench` reproduces them. The short version: **neither painter is the
 wall** — WebGL2 draws anything from 500 to 20,000 bodies in 0.06–0.5 ms — and
-the two ceilings are 9 µs per rigid body (matter, ~2,000 of them at 60 Hz) and
-packing density for grains (8,000 moving grains is 4.9 ms; the same 8,000
-settled is 0.29 ms; a box packed past ~60% never settles at all).
+the ceiling is 9 µs per rigid body (matter, ~2,000 of them at 60 Hz). Grains
+are ~0.4 µs each while they move (8,000 falling sand grains is 3.9 ms) and
+nearly free asleep (the same 8,000 settled is 0.21 ms); a box 82% full of r=5
+sand settles to zero awake. What costs is water that is really moving - a pool
+with sand sinking through it stays awake until it stops (`PLAN.md §10` has what
+shipped, what was tried and rejected, and what is still open).
 
 Ideas still open (see `PLAN.md §8`): saving a scene in `localStorage`, a
 "shake" button, funnels/dominoes as extra toy families, ropes and explosives on
 Matter constraints, a sound-block octave toggle, better mobile affordances
-(tap-to-place ghost), a worker to buy a frame of headroom, and the dashboard
+(tap-to-place ghost), a worker to buy a frame of headroom (it must own both
+engines - see `PLAN.md §10`), and the dashboard
 card + `deploy.config.json` entry.
