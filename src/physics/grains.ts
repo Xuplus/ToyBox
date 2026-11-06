@@ -193,6 +193,8 @@ export interface GrainCollider {
   isStatic: boolean;
   mass: number;
   velocity: { x: number; y: number };
+  /** Spin in rad/step, so a turning face carries the grains it touches. */
+  angularVelocity?: number;
   /** Surface drift in px/step: a conveyor belt carries whatever rests on it. */
   surface?: { x: number; y: number };
 }
@@ -278,18 +280,33 @@ const SUPPORT_FLOOR = GRAVITY_ACCEL * 1.25;
 /**
  * What one step of contact does to a body.
  *
- * `vx/vy` is its new velocity; `fx/fy` is a force to add so the medium carries
- * the body's weight - Matter applies gravity to the next step, and a supported
- * body must not have its gravity applied again.
+ * `vx/vy/w` is its new velocity and spin; `fx/fy/torque` is a force (and the
+ * turn it makes about the centre) to add so the medium carries the body's
+ * weight - Matter applies gravity to the next step, and a supported body must
+ * not have its gravity applied again.
  */
 export interface ContactImpulse {
   vx: number;
   vy: number;
+  w: number;
   fx: number;
   fy: number;
+  torque: number;
 }
 
-const NO_FORCE = { fx: 0, fy: 0 };
+/**
+ * Where a body is held, for `supportImpulse`: the offset of the support point
+ * from its centre of mass, its spin (rad/step) and its moment of inertia. A body
+ * held at its centre (no lever) behaves as a point and cannot be turned.
+ */
+export interface Lever {
+  rx: number;
+  ry: number;
+  w: number;
+  inertia: number;
+}
+
+const NO_LEVER: Lever = { rx: 0, ry: 0, w: 0, inertia: Infinity };
 
 /**
  * What a pile does to a body it is holding up.
@@ -309,6 +326,15 @@ const NO_FORCE = { fx: 0, fy: 0 };
  * body keeps going for a few steps and carves a crater, while a body that is
  * nearly at rest has its one gravity step removed. Both cases end at zero, and
  * neither can overshoot.
+ *
+ * Both act at `lever`, the point the body is standing on. The speed taken is
+ * that point's (the body's speed plus its spin about the centre), and the
+ * impulse that takes it is split between speed and spin by the body's mass and
+ * inertia, like any contact: so it still never adds energy, and a plank landing
+ * on one end is stopped at that end and swings down onto the rest of it. The
+ * weight carried there, with gravity pulling at the centre, is the turn that
+ * tips a body hanging over the edge of a heap and rights one that landed
+ * askew - and is no turn at all when it stands square on what holds it.
  */
 export function supportImpulse(
   loadX: number,
@@ -317,26 +343,38 @@ export function supportImpulse(
   vx: number,
   vy: number,
   mass: number,
+  lever: Lever = NO_LEVER,
 ): ContactImpulse {
   const len = Math.hypot(loadX, loadY);
-  if (len < 1e-6 || grip <= 0) return { vx, vy, ...NO_FORCE };
+  if (len < 1e-6 || grip <= 0) return { vx, vy, w: lever.w, fx: 0, fy: 0, torque: 0 };
 
   const nx = loadX / len;
   const ny = loadY / len;
-  const into = vx * nx + vy * ny;
+  const { rx, ry, w, inertia } = lever;
+  // r x n: how much a push along n at r turns the body.
+  const arm = rx * ny - ry * nx;
+  const into = (vx - w * ry) * nx + (vy + w * rx) * ny;
 
   let outVx = vx;
   let outVy = vy;
+  let outW = w;
   if (into < 0) {
     const take = Math.min(-into, Math.max(SUPPORT_FLOOR, -into * Math.min(1, grip)));
-    outVx += nx * take;
-    outVy += ny * take;
+    // The impulse that takes `take` out of the contact point's speed.
+    const spinShare = inertia === Infinity || inertia <= 0 ? 0 : (arm * arm) / inertia;
+    const impulse = take / (1 / mass + spinShare);
+    outVx += (nx * impulse) / mass;
+    outVy += (ny * impulse) / mass;
+    if (spinShare > 0) outW += (arm * impulse) / inertia;
   }
 
   // The weight the pile carries, along its normal. Never more than the body's
   // own weight: a support only takes away gravity, it cannot supply lift.
   const carry = ny < 0 ? -mass * GRAVITY_SCALE * ny : 0;
-  return { vx: outVx, vy: outVy, fx: nx * carry, fy: ny * carry };
+  const fx = nx * carry;
+  const fy = ny * carry;
+  const torque = inertia === Infinity ? 0 : rx * fy - ry * fx;
+  return { vx: outVx, vy: outVy, w: outW, fx, fy, torque };
 }
 
 /**
@@ -361,6 +399,75 @@ export function dragImpulse(
 
   const take = Math.min(-into, -into * Math.min(1, grip));
   return { vx: vx + nx * take, vy: vy + ny * take };
+}
+
+/**
+ * How much of a body's spin the medium takes per step, per unit of `grip`. Low:
+ * the support already stops whatever turning drives the body *into* the pile,
+ * so this is only the grind of a body rolling over it. It used to be 0.5 - half
+ * the spin gone every step anything touched - and a plank could not tip at all.
+ */
+const SPIN_GRIP = 0.06;
+
+/** What a body needs to say for `bodyResponse`: `Matter.Body` has all of it. */
+export interface GrainBody {
+  mass: number;
+  inertia: number;
+  velocity: { x: number; y: number };
+  angularVelocity: number;
+}
+
+/** A body's new speed and spin after a step of grains, and the force to add. */
+export interface BodyResponse {
+  vx: number;
+  vy: number;
+  w: number;
+  fx: number;
+  fy: number;
+  torque: number;
+}
+
+/**
+ * Everything one step of grains does to the dynamic body that was collider `c`:
+ * sand holds it up where it is standing (`supportImpulse`), water drags at it
+ * (`dragImpulse`), a pile on top of it weighs on it, and grinding through either
+ * takes a little of its spin. The engine sets the velocities and adds the force;
+ * nothing here is a spring, so none of it can throw the body back out.
+ */
+export function bodyResponse(world: GrainWorld, c: number, body: GrainBody): BodyResponse {
+  const grip = world.grip[c];
+  const weight = world.holdW[c];
+  const lever: Lever = {
+    rx: weight > 0 ? world.holdRx[c] / weight : 0,
+    ry: weight > 0 ? world.holdRy[c] / weight : 0,
+    w: body.angularVelocity,
+    inertia: body.inertia,
+  };
+  const hold = supportImpulse(
+    world.holdFx[c],
+    world.holdFy[c],
+    grip,
+    body.velocity.x,
+    body.velocity.y,
+    body.mass,
+    lever,
+  );
+  const wet = dragImpulse(world.dragX[c], world.dragY[c], grip, hold.vx, hold.vy);
+
+  let w = hold.w;
+  if (world.dragTorque[c] !== 0 && grip > 0) w *= 1 - Math.min(1, grip) * SPIN_GRIP;
+
+  let fx = hold.fx;
+  let fy = hold.fy;
+  let torque = hold.torque;
+  const lx = world.loadFx[c];
+  const ly = world.loadFy[c];
+  if (lx !== 0 || ly !== 0) {
+    fx += lx * GRAIN_FORCE;
+    fy += ly * GRAIN_FORCE;
+    torque += world.loadTorque[c] * GRAIN_FORCE;
+  }
+  return { vx: wet.vx, vy: wet.vy, w, fx, fy, torque };
 }
 
 /**
@@ -504,6 +611,7 @@ export class GrainWorld {
   private colSurfY = new Float32Array(64);
   private colCx = new Float32Array(64);
   private colCy = new Float32Array(64);
+  private colW = new Float32Array(64);
   /** 1 when the collider is moving, so grains touching it must wake */
   private colWake = new Uint8Array(64);
 
@@ -524,6 +632,20 @@ export class GrainWorld {
    */
   readonly holdFx = new Float32Array(MAX_COLLIDERS);
   readonly holdFy = new Float32Array(MAX_COLLIDERS);
+  /**
+   * Where the body is standing: the contacts in `holdF`, as a sum of their
+   * offsets from the body's centre weighted by how deep each one is, and the sum
+   * of those weights. `holdRx / holdW` is the point the pile holds it up at.
+   *
+   * Holding a body up at its centre is what kept a plank level on the side of a
+   * dune: the support and gravity then act on the same point and nothing can
+   * ever turn it. Held up where it is actually touching, a plank whose middle
+   * hangs past the edge of a heap tips over it, and a crate landing on a slope
+   * rocks onto its face.
+   */
+  readonly holdRx = new Float32Array(MAX_COLLIDERS);
+  readonly holdRy = new Float32Array(MAX_COLLIDERS);
+  readonly holdW = new Float32Array(MAX_COLLIDERS);
   /** how many grains are touching the collider - what makes a deep contact
    *  hold harder than a graze */
   readonly contacts = new Uint16Array(MAX_COLLIDERS);
@@ -1765,6 +1887,7 @@ export class GrainWorld {
       this.colMass[c] = body.isStatic ? 0 : body.mass;
       this.colVelX[c] = body.velocity.x;
       this.colVelY[c] = body.velocity.y;
+      this.colW[c] = body.isStatic ? 0 : (body.angularVelocity ?? 0);
       this.colSurfX[c] = body.surface?.x ?? 0;
       this.colSurfY[c] = body.surface?.y ?? 0;
       // A moving body drags grains with it, so anything it touches has to wake.
@@ -1775,6 +1898,9 @@ export class GrainWorld {
       this.loadTorque[c] = 0;
       this.holdFx[c] = 0;
       this.holdFy[c] = 0;
+      this.holdRx[c] = 0;
+      this.holdRy[c] = 0;
+      this.holdW[c] = 0;
       this.contacts[c] = 0;
       this.grip[c] = 0;
       this.dragX[c] = 0;
@@ -1838,6 +1964,7 @@ export class GrainWorld {
       this.colSurfY = growFloat(this.colSurfY, size);
       this.colCx = growFloat(this.colCx, size);
       this.colCy = growFloat(this.colCy, size);
+      this.colW = growFloat(this.colW, size);
       this.colWake = growFlags(this.colWake, size);
     }
     if (verts > this.colNx.length) {
@@ -2000,8 +2127,10 @@ export class GrainWorld {
     const beforeY = this.vy[i];
     const ki = this.kind[i];
     const mu = MU[ki];
-    const svx = this.colVelX[c] + this.colSurfX[c];
-    const svy = this.colVelY[c] + this.colSurfY[c];
+    // A turning body's face moves with its spin: w x r at the contact.
+    const spin = this.colW[c];
+    const svx = this.colVelX[c] + this.colSurfX[c] - spin * (gy - this.colCy[c]);
+    const svy = this.colVelY[c] + this.colSurfY[c] + spin * (gx - this.colCx[c]);
     const rvx = this.vx[i] - svx;
     const rvy = this.vy[i] - svy;
     const into = rvx * normalX + rvy * normalY;
@@ -2036,6 +2165,13 @@ export class GrainWorld {
     if (fy < 0) {
       this.holdFx[c] += fx;
       this.holdFy[c] += fy;
+      // The point of contact on the body's face, weighted by how far the grain
+      // was into it: a corner pressed deep into the pile carries more of the
+      // body than a face that is only grazing it, which is what rights a crate.
+      const weight = depth + r * 0.05;
+      this.holdRx[c] += (gx - normalX * (r - depth) - this.colCx[c]) * weight;
+      this.holdRy[c] += (gy - normalY * (r - depth) - this.colCy[c]) * weight;
+      this.holdW[c] += weight;
     }
 
     // Momentum: whatever the grain lost, the body gained. This is what makes a

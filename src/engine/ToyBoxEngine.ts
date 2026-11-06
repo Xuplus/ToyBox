@@ -13,12 +13,10 @@ import {
   windDelta,
 } from '../physics/fields';
 import {
-  dragImpulse,
+  bodyResponse,
   GRAIN,
-  GRAIN_FORCE,
   GrainWorld,
   scatterGrains,
-  supportImpulse,
   type GrainCollider,
   type GrainMaterial,
 } from '../physics/grains';
@@ -722,45 +720,19 @@ export class ToyBoxEngine {
     this.buildColliders();
     grains.step(this.colliderView);
 
-    const load = GRAIN_FORCE;
     for (let i = 0; i < this.colliderView.length; i++) {
       const body = this.colliderView[i].body;
-      if (body.isStatic) continue;
+      if (body.isStatic || grains.contacts[i] === 0) continue;
 
-      const fx = grains.loadFx[i];
-      const fy = grains.loadFy[i];
-      const grip = grains.grip[i];
-
-      // Sand: holds the body up on what it is standing on, and stops it from
-      // sinking through. Water leaves no hold, so it only ever gets drag.
-      const hold = supportImpulse(
-        grains.holdFx[i],
-        grains.holdFy[i],
-        grip,
-        body.velocity.x,
-        body.velocity.y,
-        body.mass,
-      );
-      // Water: no support, only drag.
-      const wet = dragImpulse(grains.dragX[i], grains.dragY[i], grip, hold.vx, hold.vy);
-
-      if (wet.vx !== body.velocity.x || wet.vy !== body.velocity.y) {
-        Matter.Body.setVelocity(body, { x: wet.vx, y: wet.vy });
+      // Sand holds the body up where it is standing, water only drags at it.
+      const out = bodyResponse(grains, i, body);
+      if (out.vx !== body.velocity.x || out.vy !== body.velocity.y) {
+        Matter.Body.setVelocity(body, { x: out.vx, y: out.vy });
       }
-
-      if (fx !== 0 || fy !== 0) {
-        body.force.x += fx * load + hold.fx;
-        body.force.y += fy * load + hold.fy;
-        body.torque += grains.loadTorque[i] * load;
-      }
-
-      // A body grinding through the medium loses its spin the same way it
-      // loses its speed - never more than the spin it has.
-      const spin = grains.dragTorque[i];
-      if (spin !== 0 && grip > 0) {
-        const damp = Math.min(1, grip) * 0.5;
-        Matter.Body.setAngularVelocity(body, body.angularVelocity * (1 - damp));
-      }
+      if (out.w !== body.angularVelocity) Matter.Body.setAngularVelocity(body, out.w);
+      body.force.x += out.fx;
+      body.force.y += out.fy;
+      body.torque += out.torque;
     }
   }
 
@@ -786,6 +758,7 @@ export class ToyBoxEngine {
           isStatic: body.isStatic,
           mass: body.mass,
           velocity: body.velocity,
+          angularVelocity: body.angularVelocity,
           surface: { x: 0, y: 0 },
         };
         pool[view.length] = collider;
@@ -798,6 +771,7 @@ export class ToyBoxEngine {
       collider.isStatic = body.isStatic;
       collider.mass = body.mass;
       collider.velocity = body.velocity;
+      collider.angularVelocity = body.angularVelocity;
 
       const belt = metaOf(body)?.belt;
       collider.surface.x = belt ? belt.dir * belt.speed : 0;

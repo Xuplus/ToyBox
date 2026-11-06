@@ -4,6 +4,7 @@ import {
   GRAIN,
   GRAIN_FORCE,
   GrainWorld,
+  bodyResponse,
   dragImpulse,
   supportImpulse,
 } from './grains';
@@ -92,7 +93,7 @@ describe('supportImpulse', () => {
   });
 
   it('does nothing without support', () => {
-    expect(supportImpulse(0, 0, 3, 1, 2, 1)).toEqual({ vx: 1, vy: 2, fx: 0, fy: 0 });
+    expect(supportImpulse(0, 0, 3, 1, 2, 1)).toEqual({ vx: 1, vy: 2, w: 0, fx: 0, fy: 0, torque: 0 });
     // Water leaves no load at all, so a body in it gets no hold-up.
     expect(supportImpulse(0, 0, 0.6, 0, 3, 1).vy).toBe(3);
   });
@@ -116,5 +117,95 @@ describe('dragImpulse', () => {
     const water = dragImpulse(0, -8, 0.6, 0, 4).vy;
     expect(sand).toBeLessThan(water);
     expect(GRAIN_FORCE).toBeGreaterThan(0);
+  });
+});
+
+/**
+ * A Matter body on a bed of sand, coupled the way the engine couples them:
+ * Matter steps, the grains step against the body, the body takes the response.
+ */
+function sandbox(bedLeft: number, bedRight: number, bedTop: number) {
+  const world = new GrainWorld(6000, 600, 400, { radius: 5 });
+  for (let y = 395; y > bedTop; y -= 9) {
+    for (let x = bedLeft + 5; x < bedRight; x += 10) world.add(x + ((y / 9) % 2) * 5, y, 0, 0, GRAIN.sand);
+  }
+  for (let i = 0; i < 400; i++) world.step();
+  const engine = Matter.Engine.create();
+  const run = (body: Matter.Body, steps: number, each?: () => void) => {
+    for (let s = 0; s < steps; s++) {
+      Matter.Engine.update(engine, 1000 / 60);
+      world.step([body]);
+      if (world.contacts[0] > 0) {
+        const out = bodyResponse(world, 0, body);
+        Matter.Body.setVelocity(body, { x: out.vx, y: out.vy });
+        Matter.Body.setAngularVelocity(body, out.w);
+        body.force.x += out.fx;
+        body.force.y += out.fy;
+        body.torque += out.torque;
+      }
+      each?.();
+    }
+  };
+  return { world, engine, run };
+}
+
+describe('bodyResponse - bodies turn on sand', () => {
+  it('tips a plank whose middle hangs past the edge of a bed', () => {
+    const box = sandbox(0, 250, 300);
+    // Only the left 38 px of a 176 px plank are over the sand; its middle is
+    // over nothing. Held up at its centre, it used to hover there level.
+    const plank = Matter.Bodies.rectangle(300, 288, 176, 18, { density: 0.0018 });
+    Matter.Composite.add(box.engine.world, plank);
+    box.run(plank, 90);
+    expect(plank.angle).toBeGreaterThan(0.4); // right end down
+  });
+
+  it('leaves a plank level when it lands square on a flat bed', () => {
+    const box = sandbox(0, 600, 300);
+    const plank = Matter.Bodies.rectangle(300, 270, 176, 18, { density: 0.0018 });
+    Matter.Composite.add(box.engine.world, plank);
+    let deepest = 0;
+    box.run(plank, 240, () => (deepest = Math.max(deepest, plank.position.y)));
+    expect(Math.abs(plank.angle)).toBeLessThan(0.05);
+    expect(deepest).toBeLessThan(310); // and it is still held up
+  });
+
+  it('rocks a crate that lands on its corner down onto a face', () => {
+    const box = sandbox(0, 600, 300);
+    const crate = Matter.Bodies.rectangle(300, 250, 56, 56, { density: 0.002, angle: 0.45 });
+    Matter.Composite.add(box.engine.world, crate);
+    box.run(crate, 360);
+    // Nearest face: the angle is a multiple of a quarter turn.
+    const quarter = Math.PI / 2;
+    const off = Math.abs(crate.angle - Math.round(crate.angle / quarter) * quarter);
+    expect(off).toBeLessThan(0.12);
+    expect(Math.abs(crate.angularVelocity)).toBeLessThan(0.01);
+  });
+});
+
+describe('supportImpulse - at a lever', () => {
+  it('stops the contact point without adding energy', () => {
+    const mass = 2;
+    const inertia = 4000;
+    const lever = { rx: 60, ry: 9, w: 0.02, inertia };
+    const vx = 0.3;
+    const vy = 2;
+    const out = supportImpulse(0, -10, 3, vx, vy, mass, lever);
+    const before = mass * (vx * vx + vy * vy) + inertia * lever.w * lever.w;
+    const after = mass * (out.vx * out.vx + out.vy * out.vy) + inertia * out.w * out.w;
+    expect(after).toBeLessThanOrEqual(before);
+    // The point it stands on is no longer going down into the pile...
+    const pointVy = out.vy + out.w * lever.rx;
+    expect(pointVy).toBeGreaterThanOrEqual(-1e-9);
+    // ...and stopping one end of the plank set it turning about that end.
+    expect(out.w).toBeLessThan(lever.w);
+  });
+
+  it('carries the weight as a turn about the centre when held off-centre', () => {
+    const out = supportImpulse(0, -10, 3, 0, 0.27, 1, { rx: 40, ry: 9, w: 0, inertia: 4000 });
+    expect(out.fy).toBeCloseTo(-GRAVITY_SCALE, 9);
+    expect(out.torque).toBeLessThan(0); // held on the right, so it tips left
+    const centred = supportImpulse(0, -10, 3, 0, 0.27, 1, { rx: 0, ry: 9, w: 0, inertia: 4000 });
+    expect(centred.torque).toBeCloseTo(0, 9);
   });
 });
