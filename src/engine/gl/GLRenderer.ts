@@ -248,14 +248,15 @@ export class GLRenderer implements Painter {
       gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, this.out.circles.count);
     }
 
-    // The drop preview sits above everything, so it gets its own two calls.
+    // The drop preview (and a rope being tied) sits above everything, so it
+    // gets its own two calls.
     if (this.out.ghostCircle.count > 0) {
       gl.useProgram(this.circle.program);
       gl.bindVertexArray(this.vaoGhostCircle);
       gl.uniform2f(this.uniform(this.circle, 'uWorld'), scene.worldW, scene.worldH);
       this.upload('ghostCircle', this.out.ghostCircle);
       this.upload('ghostStyle', this.out.ghostStyle);
-      gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, 1);
+      gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, this.out.ghostCircle.count);
     }
 
     if (this.out.ghostRect.count > 0) {
@@ -263,7 +264,8 @@ export class GLRenderer implements Painter {
       gl.bindVertexArray(this.vaoGhostRect);
       gl.uniform2f(this.uniform(this.rect, 'uWorld'), scene.worldW, scene.worldH);
       this.upload('ghostRect', this.out.ghostRect);
-      gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, 1);
+      // The drop preview is one rect; a rope being tied is a row of dashes.
+      gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, this.out.ghostRect.count);
     }
 
     gl.bindVertexArray(null);

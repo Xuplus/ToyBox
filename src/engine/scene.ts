@@ -11,6 +11,15 @@ export interface Ghost {
   shape: 'circle' | 'rect';
 }
 
+/** A rope being tied: a dashed line from its first end to the pointer. */
+export interface Tether {
+  ax: number;
+  ay: number;
+  bx: number;
+  by: number;
+  color: string;
+}
+
 /**
  * A short-lived flash drawn over the box: a bomb going off, a balloon popping,
  * something falling into a black hole. Plain data, aged by `Scene.time`.
@@ -43,6 +52,8 @@ export interface Scene {
   bodies: Matter.Body[];
   draggingId: number | null;
   ghost: Ghost | null;
+  /** the rope being tied, if any; drawn with the ghost */
+  tether: Tether | null;
   grains: GrainWorld | null;
   /** flashes still running; drawn over everything but the ghost */
   effects: Effect[];

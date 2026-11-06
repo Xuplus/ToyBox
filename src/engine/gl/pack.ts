@@ -22,12 +22,16 @@ import {
   GADGET,
   holeOrbits,
   holeThrob,
+  linkLook,
+  PIN_DOT,
   sparkRadius,
+  TETHER_DASH,
+  type LinkLook,
   trampolineDip,
   type Orbit,
   type Streak,
 } from '../gadgets';
-import type { Effect, Ghost, Scene } from '../scene';
+import type { Effect, Ghost, Scene, Tether } from '../scene';
 import {
   CIRCLE_STYLE,
   DOT,
@@ -141,6 +145,12 @@ export function packScene(
       case 'hole':
         packHole(out, body, meta, time, glow);
         break;
+      case 'link':
+        packLink(out, body, meta, glow);
+        break;
+      case 'pin':
+        packPin(out, body, meta, glow);
+        break;
       default:
         packBlock(out, body, meta, glow);
         break;
@@ -148,6 +158,7 @@ export function packScene(
   }
 
   for (const effect of scene.effects) packEffect(out, effect, time);
+  if (scene.tether) packTether(out, scene.tether);
   if (scene.ghost) packGhost(out, scene.ghost);
 }
 
@@ -1048,6 +1059,86 @@ function packEffect(out: SceneBuffers, effect: Effect, time: number): void {
 // --- ghost ---------------------------------------------------------------
 
 /** The drop preview: a faint fill and a dashed outline, over everything else. */
+// --- ropes and chains -----------------------------------------------------
+
+interface PackedLook {
+  look: LinkLook;
+  fill: RGB | null;
+  edge: RGB;
+}
+
+/** A link's look never changes, and a rope can be hundreds of them: worked
+ *  out once per link instead of parsing its colours every frame. */
+const LOOKS = new WeakMap<ToyMeta, PackedLook>();
+
+function packedLook(meta: ToyMeta): PackedLook {
+  let packed = LOOKS.get(meta);
+  if (!packed) {
+    const look = linkLook(meta);
+    packed = { look, fill: look.fill ? toRgb(look.fill) : null, edge: toRgb(look.edge) };
+    LOOKS.set(meta, packed);
+  }
+  return packed;
+}
+
+function packLink(out: SceneBuffers, body: Matter.Body, meta: ToyMeta, glow: number): void {
+  const { look, fill, edge } = packedLook(meta);
+  pushRect(
+    out.rects,
+    rect({
+      x: body.position.x,
+      y: body.position.y,
+      halfW: look.halfW,
+      halfH: look.halfH,
+      radius: look.halfH,
+      angle: body.angle,
+      color: fill ?? edge,
+      // A ring is only its outline.
+      alpha: fill ? 1 : 0,
+      border: edge,
+      borderW: look.edgeW,
+      glow,
+    }),
+  );
+}
+
+function packPin(out: SceneBuffers, body: Matter.Body, meta: ToyMeta, glow: number): void {
+  const { x, y } = body.position;
+  const accent = toRgb(meta.accent);
+  pushCircle(out, x, y, meta.w / 2, toRgb(meta.color), 1, accent, 1, glow);
+  pushCircle(out, x, y, PIN_DOT, accent, 1, null, 0, 0, 0, 1, 1);
+}
+
+/** The rope being tied: dashes laid along the line, drawn with the ghost. */
+function packTether(out: SceneBuffers, tether: Tether): void {
+  const color = toRgb(tether.color);
+  const dx = tether.bx - tether.ax;
+  const dy = tether.by - tether.ay;
+  const length = Math.hypot(dx, dy);
+  if (length < 1) return;
+  const ux = dx / length;
+  const uy = dy / length;
+  const angle = Math.atan2(dy, dx);
+  const [dash, gap] = TETHER_DASH;
+  for (let s = 0; s < length; s += dash + gap) {
+    const run = Math.min(dash, length - s);
+    const mid = s + run / 2;
+    pushRect(
+      out.ghostRect,
+      rect({
+        x: tether.ax + ux * mid,
+        y: tether.ay + uy * mid,
+        halfW: run / 2,
+        halfH: 1,
+        radius: 1,
+        angle,
+        color,
+        alpha: 0.8,
+      }),
+    );
+  }
+}
+
 function packGhost(out: SceneBuffers, ghost: Ghost): void {
   const color = toRgb(ghost.color);
 

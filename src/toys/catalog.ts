@@ -3,7 +3,7 @@ import { noteForIndex, noteName } from '../audio/notes';
 import { shade } from '../lib/color';
 import { GRAIN, MATERIALS, type GrainMaterial } from '../physics/grains';
 import { setMeta } from './meta';
-import type { SpawnContext, ToyDef, ToyId } from './types';
+import type { RopeSpec, SpawnContext, ToyDef, ToyId } from './types';
 
 // The toy registry. Each entry knows how to build its Matter body; everything
 // else (rendering, carrying, breaking) is driven by the metadata attached here.
@@ -521,6 +521,122 @@ const blackHole: ToyDef = {
   },
 };
 
+// --- ropes and chains -------------------------------------------------------
+//
+// Tied between two points rather than dropped: press on a toy (or on empty
+// space, which puts a pin there) and let go on another. The links are bodies,
+// joined end to end in `physics/rope.ts`; here is only what each style is made
+// of and how one link is built.
+
+const ROPE: RopeSpec = {
+  style: 'rope',
+  link: 12,
+  thick: 4,
+  density: 0.0008,
+  frictionAir: 0.02,
+  slack: 1.06,
+  stiffness: 0.9,
+  damping: 0.05,
+  snapAt: 14,
+  maxLinks: 70,
+};
+
+const CHAIN: RopeSpec = {
+  style: 'chain',
+  link: 15,
+  thick: 7,
+  density: 0.006,
+  frictionAir: 0.01,
+  slack: 1.03,
+  stiffness: 0.95,
+  damping: 0.05,
+  snapAt: 40,
+  maxLinks: 60,
+};
+
+const ROPE_COLOR = '#c8a46b';
+const CHAIN_COLOR = '#9aa3b2';
+
+/**
+ * One link of a rope or a chain, centred at (x, y) along `angle`. `group` is the
+ * rope's own (negative) collision group, so its links never fight each other
+ * where they overlap at the joints. An end link (`free`) collides with nothing:
+ * it lies on whatever it is tied to.
+ */
+export function makeLink(
+  spec: RopeSpec,
+  x: number,
+  y: number,
+  angle: number,
+  length: number,
+  index: number,
+  group: number,
+  free = false,
+): Matter.Body {
+  const body = Matter.Bodies.rectangle(x, y, length, spec.thick, {
+    label: spec.style,
+    angle,
+    density: spec.density,
+    friction: 0.6,
+    frictionStatic: 0.8,
+    frictionAir: spec.frictionAir,
+    restitution: 0.02,
+    collisionFilter: { group, category: 0x0001, mask: free ? 0 : 0xffffffff },
+  });
+  const color = spec.style === 'rope' ? ROPE_COLOR : CHAIN_COLOR;
+  return setMeta(body, {
+    toyId: spec.style,
+    kind: 'link',
+    color,
+    accent: shade(color, -0.35),
+    w: length,
+    h: spec.thick,
+    link: { style: spec.style, index },
+  });
+}
+
+function makeRope(id: 'rope' | 'chain', spec: RopeSpec, nameKey: string): ToyDef {
+  const color = spec.style === 'rope' ? ROPE_COLOR : CHAIN_COLOR;
+  return {
+    id,
+    kind: 'link',
+    nameKey,
+    color,
+    accent: shade(color, -0.35),
+    swatch: 'belt',
+    w: spec.link,
+    h: spec.thick,
+    rope: spec,
+    // Dropped on its own, a rope is one loose link.
+    build: (x, y) => makeLink(spec, x, y, 0, spec.link, 0, Matter.Body.nextGroup(true)),
+  };
+}
+
+export const PIN_R = 5;
+
+/**
+ * The peg a rope is tied to when one of its ends is in empty space. Static, so
+ * it hangs where it was put; it can be dragged and deleted like any toy, and a
+ * rope can be draped over it.
+ */
+export function makePin(x: number, y: number): Matter.Body {
+  const body = Matter.Bodies.circle(x, y, PIN_R, {
+    label: 'pin',
+    isStatic: true,
+    friction: 0.5,
+    frictionStatic: 0.7,
+    restitution: 0.1,
+  });
+  return setMeta(body, {
+    toyId: 'pin',
+    kind: 'pin',
+    color: '#d7dde8',
+    accent: '#5b6578',
+    w: PIN_R * 2,
+    h: PIN_R * 2,
+  });
+}
+
 export const TOYS: ToyDef[] = [
   makeBall({ id: 'ballBouncy', nameKey: 'toy_ballBouncy', color: '#ff6b8b', r: 14, restitution: 0.9, density: 0.0012 }),
   makeBall({ id: 'ballMarble', nameKey: 'toy_ballMarble', color: '#66d9ff', r: 9, restitution: 0.65, density: 0.004 }),
@@ -548,6 +664,9 @@ export const TOYS: ToyDef[] = [
   fan,
   trampoline,
   blackHole,
+
+  makeRope('rope', ROPE, 'toy_rope'),
+  makeRope('chain', CHAIN, 'toy_chain'),
 ];
 
 const BY_ID = new Map<string, ToyDef>(TOYS.map((toy) => [toy.id, toy]));
@@ -565,4 +684,5 @@ export const PALETTE_GROUPS: { titleKey: string; ids: ToyId[] }[] = [
   { titleKey: 'group_spawners', ids: ['ballSpawner'] },
   { titleKey: 'group_music', ids: ['noteBlock'] },
   { titleKey: 'group_gadgets', ids: ['bomb', 'balloon', 'fan', 'trampoline', 'blackHole'] },
+  { titleKey: 'group_ropes', ids: ['rope', 'chain'] },
 ];

@@ -2,7 +2,7 @@ import Matter from 'matter-js';
 import { describe, expect, it } from 'vitest';
 import { toRgb, shadeRgb } from '../../lib/color';
 import { GRAIN, GrainWorld, MATERIALS, scatterGrains } from '../../physics/grains';
-import { NOTE_H, TOYS, toyById } from '../../toys/catalog';
+import { makeLink, makePin, NOTE_H, TOYS, toyById } from '../../toys/catalog';
 import type { SpawnContext, ToyId } from '../../toys/types';
 import { metaOf, setMeta } from '../../toys/meta';
 import type { Scene } from '../scene';
@@ -34,6 +34,7 @@ function scene(bodies: Matter.Body[], extra: Partial<Scene> = {}): Scene {
     bodies,
     draggingId: null,
     ghost: null,
+    tether: null,
     grains: null,
     effects: [],
     scale: 1,
@@ -505,5 +506,43 @@ describe('packScene — gadgets', () => {
     expect(pack([], { effects: [blast], time: 700 }).circles.count).toBe(0);
     const pop = { ...blast, kind: 'pop' as const, life: 260, radius: 30 };
     expect(pack([], { effects: [pop], time: 100 }).circles.count).toBe(1);
+  });
+});
+
+describe('packScene — ropes and chains', () => {
+  const rope = toyById('rope')!.rope!;
+  const chain = toyById('chain')!.rope!;
+
+  it('draws a rope link as one capsule, overlapping the next at the joint', () => {
+    const link = makeLink(rope, 100, 50, 0.3, 12, 0, -1);
+    const out = pack([link]);
+    expect(out.rects.count).toBe(1);
+    expect(out.circles.count).toBe(0);
+    const r = rectAt(out.rects);
+    expect(r.halfW).toBeGreaterThan(6); // longer than half the link
+    expect(r.radius).toBeCloseTo(r.halfH, 6); // a capsule
+    expect(r.angle).toBeCloseTo(0.3, 6);
+  });
+
+  it('alternates a hollow ring and a bar along a chain', () => {
+    const out = pack([makeLink(chain, 0, 0, 0, 15, 0, -1), makeLink(chain, 15, 0, 0, 15, 1, -1)]);
+    expect(out.rects.count).toBe(2);
+    const ring = rectAt(out.rects, 0);
+    const bar = rectAt(out.rects, 1);
+    expect(out.rects.data[RECT.color + 3]).toBe(0); // only its outline
+    expect(out.rects.data[out.rects.stride + RECT.color + 3]).toBe(1);
+    expect(bar.halfH).toBeLessThan(ring.halfH);
+  });
+
+  it('draws a pin as a disc with a dark middle', () => {
+    const out = pack([makePin(40, 40)]);
+    expect(out.circles.count).toBe(2);
+    expect(out.rects.count).toBe(0);
+  });
+
+  it('draws the rope being tied as dashes over everything', () => {
+    const out = pack([], { tether: { ax: 0, ay: 0, bx: 120, by: 0, color: '#c8a46b' } });
+    expect(out.ghostRect.count).toBe(10); // 120 px of 7 on, 5 off
+    expect(out.rects.count).toBe(0);
   });
 });

@@ -197,7 +197,7 @@ throwing, delete tool and right-click delete, four balls, five blocks (including
 a static wedge ramp), glass and brick shattering, two belts, pitched note blocks,
 a ball spout, pause, mute, clear, EN/ES, responsive layout, starter scene, body
 cap, a live FPS readout, and a playfield size control (1×–2.5×). Sand and
-water (§10).
+water (§10). Five gadgets, ropes and chains (below).
 
 **Gadgets** — five toys that do something on their own, in their own palette
 group:
@@ -219,15 +219,61 @@ handler is overwritten; landings are queued and launched after the update.
 **Tap to turn.** A press on a static toy that moves less than 5 css px is a tap,
 not a drag; a toy with `turn` in its metadata turns by that much.
 
+**Ropes and chains** — tied between any two things in the box, in their own
+palette group. Press on a toy (or on empty space, which drops a pin) and release
+on another; or tap one end and tap the other. A second tap on the same spot
+cancels. Sand and water can't be tied to.
+
+| | link | weight | joint snaps at | feel |
+|---|---|---|---|---|
+| **Rope** | 12 px, 4 thick | light (0.0008) | 14 px | sags 6%, drapes, can be torn by a heavy yank |
+| **Chain** | 15 px, 7 thick | heavy (0.006) | 40 px | sags 3%, swings with weight, very hard to break |
+
+- A rope is a row of rigid links joined end to end by length-0 Matter
+  constraints, so it drapes over pegs, is hit by balls, blown by a fan, swallowed
+  by a black hole and cut with the delete tool. Links of one rope never collide
+  with each other (a shared negative group); the first and last link collide
+  with nothing, so a rope tied to a crate doesn't fight its own crate.
+- It is laid out *sagging* (`ropeLayout`: a parabola as long as the rope), not
+  as a straight line it would immediately fall out of, and tied to the outline
+  of a body (`surfaceAnchor`) rather than its middle. A pin or another rope's
+  link is tied at its centre.
+- `CONSTRAINT_ITERATIONS = 10` (Matter's default is 2). At 2 a cannonball on a
+  rope stretched it 120 px like a bungee; at 10 it is ~30 px and the joints
+  hold. The drag constraint's stiffness is compensated per pass (`perPass`) so
+  dragging feels the same as before.
+- A joint that opens past the rope's `snapAt` breaks with a crack.
+
+**Bodies tilt on sand.** A plank or crate dropped on a heap used to land level
+and stay level. Not because grains do not rotate - they are circles, and their
+rotation would not reach a body anyway - but because the coupling held a body
+up at its *centre of mass* (no torque) and took half its spin away on every
+step a grain touched it. Now `supportImpulse` stops the contact point at a lever
+arm, splitting the impulse between speed and spin (`take / (1/m + arm²/I)`, so
+it still never adds energy), the weight it carries gives a torque about the
+centre, and spin is only damped in proportion to grip (`SPIN_GRIP`). A plank
+hanging off the edge of a bed tips off; one landing square stays level; a crate
+on its corner rocks down onto a face. All three are pinned in
+`coupling.test.ts`.
+
+**Thin bodies hold sand.** A grain pushed out of a body used to leave through
+the nearest edge. A rope link is 4 px thick, so a grain pressed past its middle,
+or falling fast enough to step over it, was posted straight through. Now a
+grain whose move this step crossed a body (Cyrus-Beck clip, in the body's
+frame) leaves through the edge it came in by (`entryEdge`).
+
 **Open / next:**
 
 - Save and restore a scene in `localStorage` ("my contraption"), with an explicit
   clear — the app currently stores nothing at all.
-- More toy families: funnels (concave, needs poly-decomp), dominoes, ropes and
-  springs on Matter constraints — each should fit the same `ToyDef` contract.
+- More toy families: funnels (concave, needs poly-decomp), dominoes, springs
+  (a rope with one stiff-but-stretchy joint) — each should fit the same
+  `ToyDef` contract.
+- Rope follow-ups: a balloon lifts only ~100 px of rope (true to life, but a
+  "string" style a tenth of the weight would make balloon bunches work); a rope
+  drawn as one smooth curve through its links instead of a row of capsules.
 - Gadget follow-ups: wind that is blocked by what is in front of the fan; a
-  black hole that grows with what it eats (`hole.ate` is already counted);
-  balloons on a string tied to something.
+  black hole that grows with what it eats (`hole.ate` is already counted).
 - A "shake" button (random impulse to everything) and a gravity slider.
 - Better touch affordances: currently a tap both selects and spawns; a
   tap-to-place-then-drag model may read better on a phone.

@@ -21,7 +21,10 @@ export type ToyId =
   | 'balloon'
   | 'fan'
   | 'trampoline'
-  | 'blackHole';
+  | 'blackHole'
+  | 'rope'
+  | 'chain'
+  | 'pin';
 
 export type ToyKind =
   | 'ball'
@@ -34,7 +37,9 @@ export type ToyKind =
   | 'balloon'
   | 'fan'
   | 'trampoline'
-  | 'hole';
+  | 'hole'
+  | 'link'
+  | 'pin';
 
 /** A bomb's fuse, in simulated ms - so pausing the box pauses the countdown. */
 export interface FuseSpec {
@@ -70,6 +75,30 @@ export interface HoleSpec {
   core: number;
   /** what it has eaten so far (bodies and grains), for the readout */
   ate: number;
+}
+
+/**
+ * A rope or a chain: what one is made of. It is not dropped like the other toys
+ * but tied between two points - see `physics/rope.ts` and the engine's rope
+ * section.
+ */
+export interface RopeSpec {
+  style: 'rope' | 'chain';
+  /** target link length, world px - the count is rounded to fit */
+  link: number;
+  /** link thickness, world px */
+  thick: number;
+  density: number;
+  frictionAir: number;
+  /** rope length over the distance it was tied across: how much it sags */
+  slack: number;
+  /** joint stiffness, 0..1 */
+  stiffness: number;
+  damping: number;
+  /** a joint pulled this far open (world px) snaps */
+  snapAt: number;
+  /** most links in one rope, so a long one gets longer links instead */
+  maxLinks: number;
 }
 
 /** A toy that releases balls on its own - the stress-test workhorse. */
@@ -141,6 +170,8 @@ export interface ToyMeta {
   fan?: FanSpec;
   bounce?: BounceSpec;
   hole?: HoleSpec;
+  /** one link of a rope or chain, and its place along it (chains alternate) */
+  link?: { style: RopeSpec['style']; index: number };
   /** a tap (press and release without dragging) turns a static toy by this
    *  many radians - how a fan or a trampoline is aimed */
   turn?: number;
@@ -164,4 +195,7 @@ export interface ToyDef {
   w: number;
   h: number;
   build: (x: number, y: number, ctx: SpawnContext) => Matter.Body | Matter.Body[];
+  /** set for ropes and chains: the tool ties one between two points instead of
+   *  dropping `build` (which makes a single loose link) */
+  rope?: RopeSpec;
 }

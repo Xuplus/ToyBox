@@ -14,12 +14,15 @@ import {
   GADGET,
   holeOrbits,
   holeThrob,
+  linkLook,
+  PIN_DOT,
   sparkRadius,
+  TETHER_DASH,
   trampolineDip,
   type Orbit,
   type Streak,
 } from './gadgets';
-import type { Effect, Ghost, Painter, Scene } from './scene';
+import type { Effect, Ghost, Painter, Scene, Tether } from './scene';
 import { ballSprite, resetSprites } from './sprites';
 
 /** The hopper housing, shared with the WebGL painter. */
@@ -92,6 +95,7 @@ export function renderScene(ctx: CanvasRenderingContext2D, input: Scene, grid: P
   }
 
   if (input.effects.length > 0) drawEffects(ctx, input.effects, input.time);
+  if (input.tether) drawTether(ctx, input.tether);
   if (input.ghost) drawGhost(ctx, input.ghost);
   drawFrame(ctx, width, height, scale);
 }
@@ -298,6 +302,13 @@ function drawBody(
       break;
     case 'hole':
       drawHole(ctx, meta, time);
+      break;
+    case 'link':
+      ctx.rotate(body.angle);
+      drawLink(ctx, meta);
+      break;
+    case 'pin':
+      drawPin(ctx, meta);
       break;
     default:
       // Polygons are drawn from their world vertices, so no extra rotation.
@@ -883,6 +894,60 @@ function drawEffects(ctx: CanvasRenderingContext2D, effects: Effect[], time: num
     ctx.arc(effect.x, effect.y, ring.radius, 0, Math.PI * 2);
     ctx.stroke();
   }
+  ctx.restore();
+}
+
+function drawLink(ctx: CanvasRenderingContext2D, meta: ToyMeta): void {
+  const look = linkLook(meta);
+  const { halfW, halfH } = look;
+  roundedRect(ctx, -halfW, -halfH, halfW * 2, halfH * 2, halfH);
+  if (look.shape === 'ring') {
+    // Stroked inside its outline, the same as the instanced ring.
+    roundedRect(
+      ctx,
+      -halfW + look.edgeW / 2,
+      -halfH + look.edgeW / 2,
+      halfW * 2 - look.edgeW,
+      halfH * 2 - look.edgeW,
+      halfH - look.edgeW / 2,
+    );
+    ctx.lineWidth = look.edgeW;
+    ctx.strokeStyle = look.edge;
+    ctx.stroke();
+    return;
+  }
+  ctx.fillStyle = look.fill ?? look.edge;
+  ctx.fill();
+  ctx.lineWidth = look.edgeW;
+  ctx.strokeStyle = look.edge;
+  ctx.stroke();
+}
+
+function drawPin(ctx: CanvasRenderingContext2D, meta: ToyMeta): void {
+  const r = meta.w / 2;
+  ctx.beginPath();
+  ctx.arc(0, 0, r, 0, Math.PI * 2);
+  ctx.fillStyle = meta.color;
+  ctx.fill();
+  ctx.lineWidth = 1.2;
+  ctx.strokeStyle = meta.accent;
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.arc(0, 0, PIN_DOT, 0, Math.PI * 2);
+  ctx.fillStyle = meta.accent;
+  ctx.fill();
+}
+
+function drawTether(ctx: CanvasRenderingContext2D, tether: Tether): void {
+  ctx.save();
+  ctx.setLineDash([...TETHER_DASH]);
+  ctx.lineWidth = 2;
+  ctx.lineCap = 'round';
+  ctx.strokeStyle = alpha(tether.color, 0.8);
+  ctx.beginPath();
+  ctx.moveTo(tether.ax, tether.ay);
+  ctx.lineTo(tether.bx, tether.by);
+  ctx.stroke();
   ctx.restore();
 }
 

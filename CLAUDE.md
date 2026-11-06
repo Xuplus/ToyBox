@@ -9,8 +9,9 @@ Context for AI agents working in this repo. Keep this file short; see
 A **2D physics sandbox**: a box you drop toys into and knock about. Balls with
 different weight and bounciness, blocks (some shatter on impact), conveyor
 belts, ball spouts that keep feeding the box, musical blocks that play a note
-when something hits them, sand and water, and five gadgets: a bomb, a balloon, a
-fan, a trampoline and a black hole. You can grab anything with the mouse and throw it.
+when something hits them, sand and water, five gadgets (a bomb, a balloon, a
+fan, a trampoline and a black hole), and ropes and chains you can tie between
+any two things. You can grab anything with the mouse and throw it.
 Nothing is stored and nothing is uploaded — the whole simulation runs on the
 device.
 
@@ -50,10 +51,17 @@ bundle served by Caddy**, and the `/toybox` prefix is baked into the build via
   - `fields.ts` — the gadgets' maths: blast falloff and speed, the fan's wind
     column and `windDelta`, the black hole's pull, the trampoline's launch, a
     balloon's lift. Pure numbers in Matter units; the engine only loops.
+  - `rope.ts` — ropes and chains without a box: where the links of a new rope
+    go (`ropeLayout`, sagging on a parabola), where on a body it ties
+    (`surfaceAnchor`), how the links are joined (`joinLinks`) and how far a
+    joint has opened (`jointGap`).
 - `src/toys/` — the **toy registry**. `catalog.ts` is the one file to edit to add
   a toy: each `ToyDef` knows its palette metadata and how to build its Matter
   body. `meta.ts` keeps per-body metadata (colour, belt speed, break threshold,
-  pitch, spawner rate) in a `WeakMap`.
+  pitch, spawner rate, rope link) in a `WeakMap`, and `countsAsToy` (a shard
+  is not a toy, and a rope is one toy however many links it has). `tie.ts`
+  builds a whole rope between two `Tie`s - a toy def with `rope` set is placed
+  by tying, not by a click.
 - `src/engine/` — `ToyBoxEngine.ts` owns the RAF loop, pointer input
   (spawn / drag / delete / tap to turn), collision handling (note strikes,
   shattering, bombs, balloons, trampolines), the spawners, the gadgets (the
@@ -214,6 +222,19 @@ Always run `npm run typecheck` and `npm run test` after changes.
   grain's momentum change as a force on the next step with a gain of 300; it
   looked fine in a screenshot and it was a delayed spring, which is why a dune
   used to throw a ball back out. Do not reintroduce a force here.
+- **Sand holds a body up where it touches it, not at its centre.**
+  `supportImpulse` takes a `Lever` (the contact point, relative to the centre)
+  and splits the impulse between speed and spin, `take / (1/m + arm²/I)`, so a
+  plank that lands with one end on a heap tips off it. The weight carried
+  there gives a torque (`holdRx/holdRy`), and spin is only damped in proportion
+  to grip (`SPIN_GRIP`). Holding a body at its centre of mass was why planks
+  and crates never tilted on sand - grains not rotating had nothing to do with
+  it. `bodyResponse` puts the pieces together; the engine only applies it.
+- **A grain leaves a body the way it came in.** If its move this step crossed
+  the body (`entryEdge`, a Cyrus-Beck clip in the body's frame), it is pushed
+  back out through that edge; only a grain that was already inside uses the
+  nearest edge. "Nearest edge" alone posts sand straight through a 4 px rope
+  link.
 - **Buried bodies need the upward contacts only.** Without a pressure field, a
   body one radius into a pile has as many contacts above it as below, so the net
   sum is zero and it sinks for ever. `holdF` keeps just the ones pushing it up.
@@ -242,6 +263,18 @@ Always run `npm run typecheck` and `npm run test` after changes.
 - **Tap to turn.** A press that stays within `TAP_SLOP` (5 css px) of where it
   started is a tap, not a drag; on release a static toy with `turn` in its
   metadata turns by that many radians. Dynamic bodies have no tap.
+- **A rope is links plus joints, and the engine owns the joints.** Every
+  constraint of a rope is in `this.joints` with its `snapAt`; `snapJoints()`
+  runs after `Engine.update`, and `detach(body)` must run wherever a body
+  leaves the world (`remove`, `enforceLimit`, a black hole), or a joint is left
+  pulling on a body that is gone. Links of one rope share a negative collision
+  group; the two end links collide with nothing. Grains see links as ordinary
+  colliders, listed after the other toys so the 512-collider cap drops rope
+  before crates. Ropes tie to toys and pins, never to grains.
+- **`CONSTRAINT_ITERATIONS` is 10, not Matter's 2.** At 2 a rope is a bungee.
+  Matter applies a constraint's stiffness on every pass, so anything tuned per
+  step (the drag constraint) goes through `perPass()`; a new constraint that is
+  not a rope joint needs the same.
 - **Shared header UX.** Top bar in normal flow — home (`🏠`, `href="/"` → the
   `elnuevos.es` root) + `🧰` title on the left, controls and language on the
   right. Never absolutely positioned. Mirrors the sibling games.
@@ -256,7 +289,9 @@ Always run `npm run typecheck` and `npm run test` after changes.
    `makeSpawner` / `makeSource` cover the current shapes) and add it to a
    `PALETTE_GROUPS` list. A non-rectangular body sets `shape: 'poly'` on its
    metadata and is drawn from its Matter vertices (see `ramp`). A pouring hopper
-   is `makeSource` plus a `GrainMaterial` in `MATERIALS`.
+   is `makeSource` plus a `GrainMaterial` in `MATERIALS`. A rope-like toy is
+   `makeRope` with a `RopeSpec` (link size, weight, sag, `snapAt`); its look
+   is a case in `linkLook` (`gadgets.ts`), which both painters read.
 2. Add its `toy_<id>` name to both dictionaries in `src/i18n.ts`.
 3. Add a test in `src/toys/catalog.test.ts` only if it behaves unusually (the
    existing loops already build every registered toy).
@@ -268,7 +303,9 @@ delete tool and right-click delete, four balls, five blocks (including a static
 wedge ramp), breakable glass and brick, two conveyor belts, a ball spout, sand
 and water hoppers that pour into the box and are drawn by the same renderer,
 pitched note blocks (C major pentatonic, cycling), the five gadgets (bomb with
-chain reactions, balloon, fan, trampoline, black hole - `PLAN.md §8`), tap to
+chain reactions, balloon, fan, trampoline, black hole - `PLAN.md §8`), ropes
+and chains tied between any two toys or pins (drag from one to the other, or
+tap both ends), bodies that tilt and roll on sand, tap to
 turn a fan or trampoline, pause, mute, clear, EN/ES,
 responsive palette, a live FPS/bodies readout, and the playfield size control.
 
@@ -283,8 +320,8 @@ with sand sinking through it stays awake until it stops (`PLAN.md §10` has what
 shipped, what was tried and rejected, and what is still open).
 
 Ideas still open (see `PLAN.md §8`): saving a scene in `localStorage`, a
-"shake" button, funnels/dominoes as extra toy families, ropes on Matter
-constraints, a sound-block octave toggle, better mobile affordances
+"shake" button, funnels/dominoes/springs as extra toy families, a light
+"string" so balloons can lift a rope, a sound-block octave toggle, better mobile affordances
 (tap-to-place ghost), a worker to buy a frame of headroom (it must own both
 engines - see `PLAN.md §10`), and the dashboard
 card + `deploy.config.json` entry.

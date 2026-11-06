@@ -5,6 +5,7 @@
 //
 // Pure: no canvas, no GL. Every function is a few multiplies.
 
+import { shade } from '../lib/color';
 import type { ToyMeta } from '../toys/types';
 import type { Effect } from './scene';
 
@@ -174,3 +175,55 @@ export function effectRings(effect: Effect, time: number): { radius: number; alp
       return { radius: effect.radius * (2.2 - 1.9 * ease), alpha: (1 - t) * 0.8, flash: 0 };
   }
 }
+
+// --- ropes and chains ------------------------------------------------------
+
+/**
+ * How one link of a rope or chain is drawn, in its own frame (x along the
+ * link). Each is drawn a little longer than the link, so neighbours overlap at
+ * the joint and the rope reads as one line rather than a row of beads.
+ *
+ * - a rope link is a capsule, alternately a shade lighter and darker: a twist;
+ * - a chain alternates a ring seen face on with one seen edge on (a bar).
+ */
+export interface LinkLook {
+  shape: 'capsule' | 'ring' | 'bar';
+  halfW: number;
+  halfH: number;
+  /** null for a ring: it is only its outline */
+  fill: string | null;
+  edge: string;
+  edgeW: number;
+}
+
+export function linkLook(meta: ToyMeta): LinkLook {
+  const index = meta.link?.index ?? 0;
+  const h = meta.h;
+  if (meta.link?.style !== 'chain') {
+    return {
+      shape: 'capsule',
+      halfW: meta.w / 2 + h / 2,
+      halfH: h / 2,
+      fill: index % 2 === 0 ? meta.color : shade(meta.color, -0.12),
+      edge: meta.accent,
+      edgeW: 0.8,
+    };
+  }
+  if (index % 2 === 0) {
+    return { shape: 'ring', halfW: meta.w / 2 + h * 0.35, halfH: h / 2, fill: null, edge: meta.color, edgeW: h * 0.3 };
+  }
+  return {
+    shape: 'bar',
+    halfW: meta.w / 2 + h * 0.35,
+    halfH: h * 0.22,
+    fill: shade(meta.color, -0.1),
+    edge: meta.accent,
+    edgeW: 0.8,
+  };
+}
+
+/** The peg a rope is tied to in empty space: its dark middle, world px. */
+export const PIN_DOT = 1.8;
+
+/** The dashed line of a rope being tied: dash, then gap, world px. */
+export const TETHER_DASH = [7, 5] as const;

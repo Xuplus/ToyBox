@@ -22,12 +22,21 @@ import {
 } from '../physics/grains';
 import { shardGrid, shardLayout } from '../physics/shatter';
 import { planEmissions } from '../physics/spawner';
-import { clampIntoBounds, createWorld, removeBody, resizeWorld, STEP_MS } from '../physics/world';
-import { toyById } from '../toys/catalog';
-import { isShard, metaOf, setMeta } from '../toys/meta';
-import type { ToyDef, ToyId } from '../toys/types';
+import { jointGap } from '../physics/rope';
+import {
+  clampIntoBounds,
+  CONSTRAINT_ITERATIONS,
+  createWorld,
+  removeBody,
+  resizeWorld,
+  STEP_MS,
+} from '../physics/world';
+import { makePin, toyById } from '../toys/catalog';
+import { countsAsToy, metaOf, setMeta } from '../toys/meta';
+import { tiePoint, tieRope } from '../toys/tie';
+import type { RopeSpec, ToyDef, ToyId } from '../toys/types';
 import { createPainter } from './painter';
-import type { Effect, Ghost, Painter, Scene } from './scene';
+import type { Effect, Ghost, Painter, Scene, Tether } from './scene';
 
 export type Tool = 'drag' | 'delete' | ToyId;
 
@@ -74,6 +83,16 @@ const BOING_COOLDOWN = 60;
 /** A press that moves less than this (css px) is a tap: it turns a fan or a
  *  trampoline instead of dragging it. */
 const TAP_SLOP = 5;
+/** A constraint setting tuned at Matter's default of two passes, as the same
+ *  pull over the passes the world runs now (see `CONSTRAINT_ITERATIONS`). */
+const perPass = (atTwo: number) => 1 - Math.pow(1 - atTwo, 2 / CONSTRAINT_ITERATIONS);
+/** The drag constraint: 0.16 stiffness and 0.1 damping, at two passes. */
+const DRAG_STIFFNESS = perPass(0.16);
+const DRAG_DAMPING = perPass(0.1);
+/** A rope shorter than this (css px) is a tap, not a rope. */
+const ROPE_MIN = 16;
+/** How close (css px) a press has to be to a thin rope link to pick it up. */
+const LINK_PICK = 7;
 /** How often the FPS readout is pushed to React, in ms. Fast enough to feel
  *  live, slow enough that the readout can't become part of the problem. */
 const STAT_EVERY = 250;
@@ -197,6 +216,11 @@ export class ToyBoxEngine {
   private readonly holes: Matter.Body[] = [];
   private readonly bombs: Matter.Body[] = [];
   private lastGulp = -Infinity;
+  /** every rope and chain joint in the box, with how far it opens before it snaps */
+  private joints: { joint: Matter.Constraint; snapAt: number }[] = [];
+  /** the first end of a rope being tied; `armed` once the press that set it is
+   *  over, so the next release ties the other end */
+  private ropeStart: { body: Matter.Body | null; point: Matter.Vector; armed: boolean } | null = null;
 
   constructor(
     private readonly canvas: HTMLCanvasElement,
@@ -299,6 +323,7 @@ export class ToyBoxEngine {
 
   setTool(tool: Tool): void {
     this.tool = tool;
+    this.ropeStart = null;
     this.updateCursor(this.pointer);
   }
 
@@ -312,6 +337,9 @@ export class ToyBoxEngine {
 
   clear(): void {
     this.endDrag();
+    this.ropeStart = null;
+    for (const { joint } of this.joints) Matter.Composite.remove(this.world.engine.world, joint);
+    this.joints.length = 0;
     for (const body of [...this.bodies]) this.remove(body);
     this.grainWorld?.clear();
     this.effects.length = 0;
@@ -426,6 +454,7 @@ export class ToyBoxEngine {
     this.applyFields();
     carryBodies(this.bodies);
     Matter.Engine.update(this.world.engine, STEP_MS);
+    this.snapJoints();
     this.launchLandings();
     this.evictEscaped();
     this.burnFuses(STEP_MS);
@@ -741,44 +770,51 @@ export class ToyBoxEngine {
    * `this.bodies`, so a steady box reuses the same wrapper objects for ever.
    */
   private buildColliders(): void {
-    const view = this.colliderView;
-    const pool = this.colliderPool;
-    view.length = 0;
-
+    this.colliderView.length = 0;
+    // Rope links go last: the grain pass takes at most `MAX_COLLIDERS`, and a
+    // few long ropes must not push the crates out of it.
     for (const body of this.bodies) {
       // Grains fall into a black hole; they do not stand on it.
-      if (body.isSensor) continue;
-      let collider = pool[view.length];
-      if (!collider) {
-        collider = {
-          body,
-          vertices: body.vertices,
-          bounds: body.bounds,
-          position: body.position,
-          isStatic: body.isStatic,
-          mass: body.mass,
-          velocity: body.velocity,
-          angularVelocity: body.angularVelocity,
-          surface: { x: 0, y: 0 },
-        };
-        pool[view.length] = collider;
-      }
-
-      collider.body = body;
-      collider.vertices = body.vertices;
-      collider.bounds = body.bounds;
-      collider.position = body.position;
-      collider.isStatic = body.isStatic;
-      collider.mass = body.mass;
-      collider.velocity = body.velocity;
-      collider.angularVelocity = body.angularVelocity;
-
-      const belt = metaOf(body)?.belt;
-      collider.surface.x = belt ? belt.dir * belt.speed : 0;
-      collider.surface.y = 0;
-
-      view.push(collider);
+      if (!body.isSensor && metaOf(body)?.kind !== 'link') this.wrapCollider(body);
     }
+    for (const body of this.bodies) {
+      if (metaOf(body)?.kind === 'link') this.wrapCollider(body);
+    }
+  }
+
+  private wrapCollider(body: Matter.Body): void {
+    const view = this.colliderView;
+    const pool = this.colliderPool;
+    let collider = pool[view.length];
+    if (!collider) {
+      collider = {
+        body,
+        vertices: body.vertices,
+        bounds: body.bounds,
+        position: body.position,
+        isStatic: body.isStatic,
+        mass: body.mass,
+        velocity: body.velocity,
+        angularVelocity: body.angularVelocity,
+        surface: { x: 0, y: 0 },
+      };
+      pool[view.length] = collider;
+    }
+
+    collider.body = body;
+    collider.vertices = body.vertices;
+    collider.bounds = body.bounds;
+    collider.position = body.position;
+    collider.isStatic = body.isStatic;
+    collider.mass = body.mass;
+    collider.velocity = body.velocity;
+    collider.angularVelocity = body.angularVelocity;
+
+    const belt = metaOf(body)?.belt;
+    collider.surface.x = belt ? belt.dir * belt.speed : 0;
+    collider.surface.y = 0;
+
+    view.push(collider);
   }
 
   /**
@@ -994,6 +1030,132 @@ export class ToyBoxEngine {
     this.emitCount();
   }
 
+  // --- ropes and chains -------------------------------------------------
+  //
+  // A rope is tied between two presses: on a toy, or on empty space, which puts
+  // a pin there. Press, drag and let go; or tap one end and then the other. The
+  // links are ordinary dynamic bodies (`toys/tie.ts`), so the delete tool cuts
+  // a rope where it touches it, a bomb can blow one apart and a black hole eats
+  // one a link at a time. What holds it together is `this.joints`.
+
+  private releaseRope(point: Matter.Vector): void {
+    const start = this.ropeStart;
+    const spec = toyById(this.tool)?.rope;
+    if (!start || !spec) {
+      this.ropeStart = null;
+      return;
+    }
+    const far = Math.hypot(point.x - start.point.x, point.y - start.point.y) >= ROPE_MIN * this.scale;
+    if (far) {
+      this.ropeStart = null;
+      // The first end may have gone (eaten, blown up) while we waited.
+      const from = start.body && this.bodies.includes(start.body) ? start.body : null;
+      this.tie(spec, { body: from, point: start.point }, { body: this.hitTest(point), point });
+      return;
+    }
+    // A tap: the first one sets the start, a second on the same spot cancels.
+    if (!start.armed) start.armed = true;
+    else this.ropeStart = null;
+  }
+
+  private tie(
+    spec: RopeSpec,
+    a: { body: Matter.Body | null; point: Matter.Vector },
+    b: { body: Matter.Body | null; point: Matter.Vector },
+  ): void {
+    // Both ends on one body is not a rope, it is a loop of string on a crate.
+    if (a.body && a.body === b.body) return;
+
+    const bodyA = a.body ?? this.addPin(a.point);
+    const bodyB = b.body ?? this.addPin(b.point);
+    const pointA = tiePoint(bodyA, a.point, b.point);
+    const pointB = tiePoint(bodyB, b.point, pointA);
+    const { links, joints } = tieRope(spec, { body: bodyA, point: pointA }, { body: bodyB, point: pointB });
+
+    // Joints first: adding the links may evict the oldest body in the box, and
+    // if that is one of the ends, `detach` has to find its joints to drop them.
+    for (const joint of joints) {
+      Matter.Composite.add(this.world.engine.world, joint);
+      this.joints.push({ joint, snapAt: spec.snapAt });
+    }
+    for (const link of links) this.add(link);
+    for (const end of [bodyA, bodyB]) if (!end.isStatic) Matter.Sleeping.set(end, false);
+    this.emitCount();
+  }
+
+  private addPin(point: Matter.Vector): Matter.Body {
+    const pin = makePin(point.x, point.y);
+    clampIntoBounds(pin, this.size.w, this.size.h);
+    this.add(pin);
+    return pin;
+  }
+
+  /** Drop every joint that holds `body`: it has left the box. */
+  private detach(body: Matter.Body): void {
+    const joints = this.joints;
+    let keep = 0;
+    for (const entry of joints) {
+      if (entry.joint.bodyA === body || entry.joint.bodyB === body) {
+        Matter.Composite.remove(this.world.engine.world, entry.joint);
+      } else {
+        joints[keep++] = entry;
+      }
+    }
+    joints.length = keep;
+  }
+
+  /** A joint pulled further open than its rope can take snaps. */
+  private snapJoints(): void {
+    const joints = this.joints;
+    let keep = 0;
+    let snapped = 0;
+    for (const entry of joints) {
+      if (jointGap(entry.joint) > entry.snapAt) {
+        Matter.Composite.remove(this.world.engine.world, entry.joint);
+        snapped++;
+      } else {
+        joints[keep++] = entry;
+      }
+    }
+    joints.length = keep;
+    if (snapped > 0) this.synth.crack(0.35);
+  }
+
+  /**
+   * A rope link is a few px thick, which is too thin to hit with a finger: the
+   * link nearest the press, if it is within `LINK_PICK`.
+   */
+  private nearestLink(point: Matter.Vector): Matter.Body | null {
+    let best: Matter.Body | null = null;
+    let bestD = LINK_PICK * this.scale;
+    for (const body of this.bodies) {
+      const meta = metaOf(body);
+      if (meta?.kind !== 'link') continue;
+      const half = meta.w / 2;
+      const c = Math.cos(body.angle);
+      const s = Math.sin(body.angle);
+      const along = (point.x - body.position.x) * c + (point.y - body.position.y) * s;
+      const t = Math.max(-half, Math.min(half, along));
+      const d =
+        Math.hypot(point.x - (body.position.x + c * t), point.y - (body.position.y + s * t)) - meta.h / 2;
+      if (d < bestD) {
+        bestD = d;
+        best = body;
+      }
+    }
+    return best;
+  }
+
+  /** The line from a half-tied rope's first end to the pointer. */
+  private currentTether(): Tether | null {
+    const start = this.ropeStart;
+    const toy = toyById(this.tool);
+    if (!start || !toy?.rope) return null;
+    const from = start.body && this.bodies.includes(start.body) ? start.body : null;
+    const a = from ? tiePoint(from, start.point, this.pointer) : start.point;
+    return { ax: a.x, ay: a.y, bx: this.pointer.x, by: this.pointer.y, color: toy.color };
+  }
+
   // --- bodies ------------------------------------------------------------
 
   private add(body: Matter.Body): void {
@@ -1008,6 +1170,7 @@ export class ToyBoxEngine {
     const { min, max } = body.bounds;
     this.grainWorld?.wakeIn(min.x, min.y, max.x, max.y);
     removeBody(this.world, body);
+    this.detach(body);
     const index = this.bodies.indexOf(body);
     if (index >= 0) this.bodies.splice(index, 1);
   }
@@ -1019,6 +1182,7 @@ export class ToyBoxEngine {
       const [oldest] = this.bodies.splice(index, 1);
       if (this.drag?.body === oldest) this.endDrag();
       removeBody(this.world, oldest);
+      this.detach(oldest);
     }
   }
 
@@ -1070,7 +1234,7 @@ export class ToyBoxEngine {
     const frame = this.meter.snapshot();
     const grains = this.grainWorld;
     let toys = 0;
-    for (const body of this.bodies) if (!isShard(body)) toys++;
+    for (const body of this.bodies) if (countsAsToy(body)) toys++;
 
     return {
       fps: frame.fps,
@@ -1140,7 +1304,7 @@ export class ToyBoxEngine {
   private emitCount(): void {
     // Grains count as bodies, not as toys: twelve thousand grains are one pile.
     const grains = this.grainWorld?.count ?? 0;
-    const toys = this.bodies.filter((body) => !isShard(body)).length;
+    const toys = this.bodies.filter(countsAsToy).length;
     this.callbacks.onCount(toys, this.bodies.length + grains);
   }
 
@@ -1156,6 +1320,12 @@ export class ToyBoxEngine {
 
     if (event.button === 2) return; // right click is handled by onContextMenu
     event.preventDefault();
+
+    // A rope is tied, not dropped: this press is one of its ends.
+    if (toyById(this.tool)?.rope) {
+      if (!this.ropeStart) this.ropeStart = { body: this.hitTest(point), point, armed: false };
+      return;
+    }
 
     const hit = this.hitTest(point);
 
@@ -1222,6 +1392,7 @@ export class ToyBoxEngine {
 
   private onPointerUp = (): void => {
     this.erasing = false;
+    if (this.ropeStart) this.releaseRope(this.pointer);
     const drag = this.drag;
     if (!drag) return;
     this.endDrag();
@@ -1273,8 +1444,8 @@ export class ToyBoxEngine {
         pointA: { x: point.x, y: point.y },
         bodyB: body,
         pointB: local,
-        stiffness: 0.16,
-        damping: 0.1,
+        stiffness: DRAG_STIFFNESS,
+        damping: DRAG_DAMPING,
         length: 0,
       });
       Matter.Composite.add(this.world.engine.world, constraint);
@@ -1295,7 +1466,7 @@ export class ToyBoxEngine {
 
   private hitTest(point: Matter.Vector): Matter.Body | null {
     const found = Matter.Query.point(this.bodies, point);
-    if (found.length === 0) return null;
+    if (found.length === 0) return this.nearestLink(point);
 
     // Highest id = most recently added = on top.
     let top = found[0];
@@ -1313,7 +1484,8 @@ export class ToyBoxEngine {
   }
 
   private updateCursor(point: Matter.Vector): void {
-    if (this.tool === 'delete') {
+    // A press ties a rope whatever is under it, so there is nothing to grab.
+    if (this.tool === 'delete' || toyById(this.tool)?.rope) {
       this.setCursor('crosshair');
       return;
     }
@@ -1349,6 +1521,7 @@ export class ToyBoxEngine {
       useSprites: this.sprites,
       grains: this.grainWorld,
       effects: this.liveEffects(),
+      tether: this.currentTether(),
     };
     this.painter.draw(scene);
   }
@@ -1367,6 +1540,10 @@ export class ToyBoxEngine {
 
     const toy = toyById(this.tool);
     if (!toy) return null;
+    if (toy.rope) {
+      // Where the rope will tie on: a pin's worth of preview at the pointer.
+      return { x: this.pointer.x, y: this.pointer.y, w: 10, h: 10, color: toy.color, shape: 'circle' };
+    }
 
     return {
       x: this.pointer.x,

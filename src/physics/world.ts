@@ -21,6 +21,9 @@ export const GRAVITY_ACCEL = GRAVITY_SCALE * STEP_MS * STEP_MS;
  *  exactly the inside of the box - nothing can leave and nothing is drawn over. */
 const WALL = 80;
 
+/** Constraint passes per step - see `createWorld`. */
+export const CONSTRAINT_ITERATIONS = 10;
+
 export interface World {
   engine: Matter.Engine;
   width: number;
@@ -32,6 +35,12 @@ export function createWorld(width: number, height: number): World {
   const engine = Matter.Engine.create();
   engine.gravity.x = 0;
   engine.gravity.y = 1;
+  // Ropes: a row of light links holding a heavy load is the case Matter's
+  // constraint solver converges worst on, and at its default of 2 a cannonball
+  // on a rope stretched it like a bungee (120 px over 15 links). 10 brings that
+  // to ~30 with links light enough for a balloon to lift some of the rope, for
+  // ~0.05 ms a step. The drag constraint is tuned per pass - see the engine.
+  engine.constraintIterations = CONSTRAINT_ITERATIONS;
 
   const world: World = { engine, width, height, walls: [] };
   buildWalls(world);

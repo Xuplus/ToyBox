@@ -18,3 +18,14 @@ export function metaOf(body: Matter.Body): ToyMeta | undefined {
 export function isShard(body: Matter.Body): boolean {
   return META.get(body)?.shard === true;
 }
+
+/**
+ * Whether a body counts in the "toys" readout: not a shard, and a rope counts
+ * once - by its first link - rather than once per link.
+ */
+export function countsAsToy(body: Matter.Body): boolean {
+  const meta = META.get(body);
+  if (!meta) return true;
+  if (meta.shard === true) return false;
+  return !meta.link || meta.link.index === 0;
+}
