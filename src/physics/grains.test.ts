@@ -175,6 +175,29 @@ describe('GrainWorld - rigid bodies', () => {
     }
   });
 
+  it('holds a falling stream and a heap on a body thinner than a grain', () => {
+    // A rope link is 4 px thick, a grain 10 across. Pressed past the middle,
+    // the far side is the nearest edge; falling fast, a grain steps clean over
+    // it. Either way it must come back out of the side it came in by.
+    const w = world(800, 300, 400, 5);
+    const bar = platform(150, 200, 240, 4);
+    const above: boolean[] = [];
+    let through = 0;
+    for (let s = 0; s < 500; s++) {
+      if (s < 400 && s % 2 === 0) for (let k = 0; k < 4; k++) w.add(126 + k * 12 + (s % 4), 10, 0, 4);
+      w.step([bar]);
+      // Over the bar one step, under it the next. (What spills off the ends
+      // spreads across the floor below it, so a census at the end proves nothing.)
+      for (let i = 0; i < w.count; i++) {
+        const over = w.y[i] < 200;
+        if (above[i] && !over && w.x[i] > 35 && w.x[i] < 265) through++;
+        above[i] = over;
+      }
+    }
+    expect(w.count).toBeGreaterThan(700);
+    expect(through).toBe(0);
+  });
+
   it('leaves its weight on a dynamic body, pointing into it', () => {
     const w = world(30, 200, 300, 5);
     const crate = Matter.Bodies.rectangle(100, 200, 160, 20);

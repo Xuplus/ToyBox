@@ -2036,6 +2036,46 @@ export class GrainWorld {
     }
   }
 
+  /**
+   * The edge of collider `c` that grain `i`'s move this step entered it
+   * through, or -1 if the move did not cross it. The move is taken in the
+   * body's frame (the body's own move this step taken off) and clipped against
+   * its edge lines, Cyrus-Beck: the entry is the last line the path comes in
+   * through, and it only counts if it comes before the path leaves by another.
+   */
+  private entryEdge(c: number, i: number, gx: number, gy: number): number {
+    const base = this.colStart[c];
+    const verts = this.colVerts[c];
+    const fromX = this.prevX[i] - this.colVelX[c];
+    const fromY = this.prevY[i] - this.colVelY[c];
+    const dx = gx - fromX;
+    const dy = gy - fromY;
+    if (dx * dx + dy * dy < 1e-6) return -1;
+    let enter = 0;
+    let leave = 1;
+    let edge = -1;
+    for (let k = 0; k < verts; k++) {
+      const nx = this.colNx[base + k];
+      const ny = this.colNy[base + k];
+      const s = nx * fromX + ny * fromY - this.colOff[base + k];
+      const along = nx * dx + ny * dy;
+      if (along < 0) {
+        const t = -s / along;
+        if (t > enter) {
+          enter = t;
+          edge = k;
+        }
+      } else if (along > 0) {
+        const t = -s / along;
+        if (t < leave) leave = t;
+      } else if (s > 0) {
+        return -1; // parallel to this edge and outside it
+      }
+      if (enter > leave) return -1;
+    }
+    return edge;
+  }
+
   /** Circle vs convex polygon, position-based, with a load left on the body. */
   private collideGrain(c: number, i: number, gx: number, gy: number): void {
     const r = this.options.radius;
@@ -2058,7 +2098,19 @@ export class GrainWorld {
     let normalY: number;
     let depth: number;
 
-    if (maxS <= 0) {
+    // Did this step's move go through the body? Then the grain leaves the way
+    // it came, wherever it is now. A thin body - a rope link is 4 px - has its
+    // far side nearer than its near one as soon as a grain pressed into it
+    // passes the middle, and a falling grain can step from above it to below
+    // it in one go: "nearest edge" posts either straight through.
+    const entry = this.entryEdge(c, i, gx, gy);
+    if (entry >= 0) {
+      this.anchorTick[i] = 0;
+      this.quiet[i] = 0;
+      normalX = snx[base + entry];
+      normalY = sny[base + entry];
+      depth = r - (normalX * gx + normalY * gy - soff[base + entry]);
+    } else if (maxS <= 0) {
       // Centre inside the hull: leave through the nearest edge. A grain in here
       // must not be allowed to fall asleep inside a body - it is not at rest,
       // it is stuck - so its sleep window never completes.
