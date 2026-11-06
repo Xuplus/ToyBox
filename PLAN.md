@@ -196,15 +196,38 @@ exercise them in plain Node. Canvas and pointer code lives only in `engine/`.
 throwing, delete tool and right-click delete, four balls, five blocks (including
 a static wedge ramp), glass and brick shattering, two belts, pitched note blocks,
 a ball spout, pause, mute, clear, EN/ES, responsive layout, starter scene, body
-cap, a live FPS readout, and a playfield size control (1×–2.5×).
+cap, a live FPS readout, and a playfield size control (1×–2.5×). Sand and
+water (§10).
+
+**Gadgets** — five toys that do something on their own, in their own palette
+group:
+
+| toy | what it does | where it lives |
+|---|---|---|
+| **Bomb** | a lit fuse (2.6 s of simulated time, so pause stops it); goes off early if hit at > 22 px/step. Throws everything within 200 px outward (light things further, `blastSpeed`), shatters glass and brick, pops balloons, sets off other bombs a beat later (chain reactions), rings note blocks, and blows a crater in sand | `detonate()` |
+| **Balloon** | lighter than air (`lift` 1.6 g), never spins, pops at a 6 px/step impact into three scraps | `pop()` |
+| **Fan** | static; wind along its own "up", out to 420 px in a column that widens and fades. Wind is drag towards the speed of the air (`windDelta`), so a beach ball hovers over a fan and a cannonball does not move; blows sand and water too. Tap to turn a quarter | `applyFields()` |
+| **Trampoline** | static; whatever lands on its top face is thrown back out at ≥ 14 px/step (≈ 350 px high), a bit harder than it came in, capped at 24. Tap to tilt 45° | `launchLandings()` |
+| **Black hole** | a static sensor: pulls every moving body and grain within 320 px inward with a swirl, and swallows whatever reaches its core | `applyFields()`, `feedHoles()` |
+
+All five are pushes on the one simulation clock: a change of speed handed to
+Matter as a force before the update (`nudge`), and the maths is pure and tested
+in `physics/fields.ts`. The trampoline is the exception that proves the rule -
+Matter's contact solver runs after `collisionStart`, so a velocity set in the
+handler is overwritten; landings are queued and launched after the update.
+
+**Tap to turn.** A press on a static toy that moves less than 5 css px is a tap,
+not a drag; a toy with `turn` in its metadata turns by that much.
 
 **Open / next:**
 
 - Save and restore a scene in `localStorage` ("my contraption"), with an explicit
   clear — the app currently stores nothing at all.
-- More toy families: funnels (concave, needs poly-decomp), dominoes, a fan, a
-  spring, a balloon (negative gravity) — each should fit the same `ToyDef`
-  contract.
+- More toy families: funnels (concave, needs poly-decomp), dominoes, ropes and
+  springs on Matter constraints — each should fit the same `ToyDef` contract.
+- Gadget follow-ups: wind that is blocked by what is in front of the fan; a
+  black hole that grows with what it eats (`hole.ate` is already counted);
+  balloons on a string tied to something.
 - A "shake" button (random impulse to everything) and a gravity slider.
 - Better touch affordances: currently a tap both selects and spawns; a
   tap-to-place-then-drag model may read better on a phone.

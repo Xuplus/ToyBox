@@ -326,6 +326,201 @@ const noteBlock: ToyDef = {
   },
 };
 
+// --- gadgets -------------------------------------------------------------
+//
+// The five toys below do something on their own rather than just sit there.
+// What they do lives in the engine (`ToyBoxEngine`, the gadget section) and in
+// the pure maths of `physics/fields.ts`; here they only get a body and the
+// numbers that tune them.
+
+export const BOMB_R = 16;
+/** How long a bomb's fuse burns, simulated ms. */
+export const FUSE_MS = 2600;
+
+/**
+ * A round black bomb with a lit fuse. It goes off when the fuse runs out, when
+ * it is hit hard, or when another bomb goes off next to it.
+ */
+const bomb: ToyDef = {
+  id: 'bomb',
+  kind: 'bomb',
+  nameKey: 'toy_bomb',
+  color: '#2c303b',
+  accent: '#ff8a3d',
+  swatch: 'circle',
+  w: BOMB_R * 2,
+  h: BOMB_R * 2,
+  build(x, y) {
+    const body = Matter.Bodies.circle(x, y, BOMB_R, {
+      label: 'bomb',
+      friction: 0.3,
+      frictionStatic: 0.5,
+      frictionAir: 0.006,
+      restitution: 0.3,
+      density: 0.004,
+    });
+    return setMeta(body, {
+      toyId: 'bomb',
+      kind: 'bomb',
+      color: '#2c303b',
+      accent: '#ff8a3d',
+      w: BOMB_R * 2,
+      h: BOMB_R * 2,
+      fuse: { left: FUSE_MS, total: FUSE_MS },
+    });
+  },
+};
+
+export const BALLOON_R = 22;
+/** One colour per balloon, cycling, so a bunch reads as a bunch. */
+const BALLOON_COLORS = ['#ff4d6d', '#ffb703', '#4cc9f0', '#80ed99', '#c77dff', '#ff8fab'];
+
+/**
+ * Lighter than air: it floats up, bumps along the ceiling, can be blown about
+ * by a fan, and pops when something hits it hard. It never spins, so its knot
+ * and string always hang underneath.
+ */
+const balloon: ToyDef = {
+  id: 'balloon',
+  kind: 'balloon',
+  nameKey: 'toy_balloon',
+  color: BALLOON_COLORS[0],
+  accent: shade(BALLOON_COLORS[0], 0.4),
+  swatch: 'circle',
+  w: BALLOON_R * 2,
+  h: BALLOON_R * 2,
+  build(x, y, ctx: SpawnContext) {
+    const color = BALLOON_COLORS[ctx.noteIndex % BALLOON_COLORS.length];
+    const body = Matter.Bodies.circle(x, y, BALLOON_R, {
+      label: 'balloon',
+      friction: 0.1,
+      frictionStatic: 0.2,
+      frictionAir: 0.035,
+      restitution: 0.55,
+      density: 0.00035,
+    });
+    Matter.Body.setInertia(body, Infinity);
+    return setMeta(body, {
+      toyId: 'balloon',
+      kind: 'balloon',
+      color,
+      accent: shade(color, 0.4),
+      w: BALLOON_R * 2,
+      h: BALLOON_R * 2,
+      lift: 1.6,
+      popsAt: 6,
+    });
+  },
+};
+
+const FAN_W = 76;
+const FAN_H = 34;
+
+/**
+ * A fan that blows along its own "up". Tap it to turn it a quarter. Light
+ * things fly, heavy things slide, and sand and water get blown about.
+ */
+const fan: ToyDef = {
+  id: 'fan',
+  kind: 'fan',
+  nameKey: 'toy_fan',
+  color: '#4a5568',
+  accent: '#9be7ff',
+  swatch: 'spawner',
+  w: FAN_W,
+  h: FAN_H,
+  build(x, y) {
+    const body = Matter.Bodies.rectangle(x, y, FAN_W, FAN_H, {
+      label: 'fan',
+      isStatic: true,
+      friction: 0.4,
+      frictionStatic: 0.6,
+      restitution: 0.1,
+    });
+    return setMeta(body, {
+      toyId: 'fan',
+      kind: 'fan',
+      color: '#4a5568',
+      accent: '#9be7ff',
+      w: FAN_W,
+      h: FAN_H,
+      fan: { strength: 1, reach: 420 },
+      turn: Math.PI / 2,
+    });
+  },
+};
+
+const TRAMPOLINE_W = 130;
+const TRAMPOLINE_H = 16;
+
+/**
+ * A springy pad: whatever lands on its top face is thrown back out, harder
+ * than it came in. Tap it to tilt it, and it throws things sideways.
+ */
+const trampoline: ToyDef = {
+  id: 'trampoline',
+  kind: 'trampoline',
+  nameKey: 'toy_trampoline',
+  color: '#ff5d73',
+  accent: '#2f3646',
+  swatch: 'belt',
+  w: TRAMPOLINE_W,
+  h: TRAMPOLINE_H,
+  build(x, y) {
+    const body = Matter.Bodies.rectangle(x, y, TRAMPOLINE_W, TRAMPOLINE_H, {
+      label: 'trampoline',
+      isStatic: true,
+      friction: 0.6,
+      frictionStatic: 0.8,
+      restitution: 0,
+    });
+    return setMeta(body, {
+      toyId: 'trampoline',
+      kind: 'trampoline',
+      color: '#ff5d73',
+      accent: '#2f3646',
+      w: TRAMPOLINE_W,
+      h: TRAMPOLINE_H,
+      bounce: { launch: 14, max: 24 },
+      turn: Math.PI / 4,
+    });
+  },
+};
+
+export const HOLE_R = 24;
+
+/**
+ * A black hole. It stays where it is put, pulls in everything that moves -
+ * toys, sand, water - swirling it round, and swallows whatever reaches the
+ * middle. It is a sensor: nothing collides with it, things fall *in*.
+ */
+const blackHole: ToyDef = {
+  id: 'blackHole',
+  kind: 'hole',
+  nameKey: 'toy_blackHole',
+  color: '#1a0f2e',
+  accent: '#b07cff',
+  swatch: 'circle',
+  w: HOLE_R * 2,
+  h: HOLE_R * 2,
+  build(x, y) {
+    const body = Matter.Bodies.circle(x, y, HOLE_R, {
+      label: 'blackHole',
+      isStatic: true,
+      isSensor: true,
+    });
+    return setMeta(body, {
+      toyId: 'blackHole',
+      kind: 'hole',
+      color: '#1a0f2e',
+      accent: '#b07cff',
+      w: HOLE_R * 2,
+      h: HOLE_R * 2,
+      hole: { reach: 320, pull: 1.2, swirl: 0.5, core: HOLE_R - 2, ate: 0 },
+    });
+  },
+};
+
 export const TOYS: ToyDef[] = [
   makeBall({ id: 'ballBouncy', nameKey: 'toy_ballBouncy', color: '#ff6b8b', r: 14, restitution: 0.9, density: 0.0012 }),
   makeBall({ id: 'ballMarble', nameKey: 'toy_ballMarble', color: '#66d9ff', r: 9, restitution: 0.65, density: 0.004 }),
@@ -347,6 +542,12 @@ export const TOYS: ToyDef[] = [
   makeSource('waterSource', GRAIN.water, 'toy_waterSource', 150),
 
   noteBlock,
+
+  bomb,
+  balloon,
+  fan,
+  trampoline,
+  blackHole,
 ];
 
 const BY_ID = new Map<string, ToyDef>(TOYS.map((toy) => [toy.id, toy]));
@@ -363,4 +564,5 @@ export const PALETTE_GROUPS: { titleKey: string; ids: ToyId[] }[] = [
   { titleKey: 'group_belts', ids: ['beltRight', 'beltLeft'] },
   { titleKey: 'group_spawners', ids: ['ballSpawner'] },
   { titleKey: 'group_music', ids: ['noteBlock'] },
+  { titleKey: 'group_gadgets', ids: ['bomb', 'balloon', 'fan', 'trampoline', 'blackHole'] },
 ];

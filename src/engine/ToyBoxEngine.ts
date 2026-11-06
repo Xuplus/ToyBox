@@ -3,6 +3,16 @@ import type { Synth } from '../audio/synth';
 import { FrameMeter } from '../lib/frame-meter';
 import { carryBodies } from '../physics/conveyor';
 import {
+  blastSpeed,
+  direction,
+  falloff,
+  holePull,
+  launchVelocity,
+  liftSpeed,
+  windAt,
+  windDelta,
+} from '../physics/fields';
+import {
   dragImpulse,
   GRAIN,
   GRAIN_FORCE,
@@ -19,7 +29,7 @@ import { toyById } from '../toys/catalog';
 import { isShard, metaOf, setMeta } from '../toys/meta';
 import type { ToyDef, ToyId } from '../toys/types';
 import { createPainter } from './painter';
-import type { Ghost, Painter, Scene } from './scene';
+import type { Effect, Ghost, Painter, Scene } from './scene';
 
 export type Tool = 'drag' | 'delete' | ToyId;
 
@@ -37,6 +47,35 @@ const ERASE_RADIUS = 22;
 const NOTE_THRESHOLD = 1.2;
 /** Minimum gap between two sounds from the same block, in ms. */
 const NOTE_COOLDOWN = 70;
+/** Impact speed (px/step) that sets a bomb off before its fuse has burnt down.
+ *  A drop from most of the way up a normal box, or a hard throw. */
+const BOMB_TOUCHY = 22;
+/** How far a blast reaches, world px. */
+const BLAST_RADIUS = 200;
+/** Speed (px/step) a blast gives a body of mass 1 right next to it. */
+const BLAST_STRENGTH = 26;
+/** Grains a blast simply removes, world px around the bomb. */
+const BLAST_CRATER = 34;
+/** Outward speed (px/step) a blast gives the grains next to it. */
+const BLAST_GRAINS = 9;
+/** Delay before a bomb caught in another bomb's blast goes off, ms. */
+const CHAIN_MS = 110;
+/** Wind on grains: push per step and the speed of the air, at strength 1. */
+const GRAIN_WIND = 0.55;
+const GRAIN_AIR = 7;
+/** A black hole's pull on grains: inward and sideways, px/step² at its middle. */
+const GRAIN_PULL = 0.7;
+const GRAIN_SWIRL = 0.3;
+/** Half-width of a fan's air column, as a fraction of the fan's width. */
+const FAN_SPREAD = 0.7;
+/** A sleeping body near a gadget is woken once the push on it is this big. */
+const WAKE_PUSH = 0.05;
+/** Gaps between two of the same gadget sound, ms. */
+const GULP_COOLDOWN = 90;
+const BOING_COOLDOWN = 60;
+/** A press that moves less than this (css px) is a tap: it turns a fan or a
+ *  trampoline instead of dragging it. */
+const TAP_SLOP = 5;
 /** How often the FPS readout is pushed to React, in ms. Fast enough to feel
  *  live, slow enough that the readout can't become part of the problem. */
 const STAT_EVERY = 250;
@@ -88,6 +127,18 @@ interface DragState {
   /** null for static bodies, which are moved directly instead */
   constraint: Matter.Constraint | null;
   offset: Matter.Vector;
+  /** where the press started, world px - a tap is a press that stays put */
+  start: Matter.Vector;
+  /** true once the pointer has gone further than `TAP_SLOP` */
+  moved: boolean;
+}
+
+/** A body that touched a trampoline this step, and how fast it was coming. */
+interface Landing {
+  body: Matter.Body;
+  pad: Matter.Body;
+  vx: number;
+  vy: number;
 }
 
 /**
@@ -137,6 +188,17 @@ export class ToyBoxEngine {
   private readonly colliderView: BodyCollider[] = [];
   /** true while the delete tool is being dragged through the box */
   private erasing = false;
+  /** flashes still on screen */
+  private effects: Effect[] = [];
+  /** trampoline contacts from this step's collisions, applied after it */
+  private landings: Landing[] = [];
+  /** bombs that were hit hard enough to go off, handled after the update */
+  private fused: Matter.Body[] = [];
+  /** the gadgets, gathered once per step */
+  private readonly fans: Matter.Body[] = [];
+  private readonly holes: Matter.Body[] = [];
+  private readonly bombs: Matter.Body[] = [];
+  private lastGulp = -Infinity;
 
   constructor(
     private readonly canvas: HTMLCanvasElement,
@@ -254,6 +316,9 @@ export class ToyBoxEngine {
     this.endDrag();
     for (const body of [...this.bodies]) this.remove(body);
     this.grainWorld?.clear();
+    this.effects.length = 0;
+    this.landings.length = 0;
+    this.fused.length = 0;
     this.noteCounter = 0;
     this.emitCount();
   }
@@ -303,7 +368,8 @@ export class ToyBoxEngine {
     const marble = toyById('ballMarble');
     const beach = toyById('ballBeach');
     const crate = toyById('crate');
-    if (!belt || !note || !bouncy || !marble || !beach || !crate) return;
+    const balloon = toyById('balloon');
+    if (!belt || !note || !bouncy || !marble || !beach || !crate || !balloon) return;
 
     this.spawn(belt, { x: w * 0.72, y: h - 40 });
     this.spawn(note, { x: w * 0.26, y: h - 42 });
@@ -312,6 +378,8 @@ export class ToyBoxEngine {
     this.spawn(bouncy, { x: w * 0.36, y: 100 });
     this.spawn(marble, { x: w * 0.52, y: 150 });
     this.spawn(beach, { x: w * 0.63, y: 108 });
+    // It floats up on its own, which says "gadgets" before anyone reads a label.
+    this.spawn(balloon, { x: w * 0.12, y: h - 60 });
   }
 
   // --- simulation --------------------------------------------------------
@@ -357,10 +425,283 @@ export class ToyBoxEngine {
   private step(): void {
     this.spawnFromSpawners(STEP_MS);
     this.pourSources(STEP_MS);
+    this.applyFields();
     carryBodies(this.bodies);
     Matter.Engine.update(this.world.engine, STEP_MS);
+    this.launchLandings();
     this.evictEscaped();
+    this.burnFuses(STEP_MS);
+    this.feedHoles();
     this.stepGrains();
+  }
+
+  // --- gadgets -----------------------------------------------------------
+  //
+  // The bomb, balloon, fan, trampoline and black hole. The maths is in
+  // `physics/fields.ts`; this is the part that loops over bodies and grains.
+  // Every push here is a change of speed handed to Matter as a force before
+  // the update, so it is integrated with gravity on the one simulation clock.
+
+  /** Turn a change of speed this step (px/step) into the force Matter wants. */
+  private nudge(body: Matter.Body, dvx: number, dvy: number): void {
+    const k = body.mass / (STEP_MS * STEP_MS);
+    body.force.x += dvx * k;
+    body.force.y += dvy * k;
+    if (body.isSleeping && Math.abs(dvx) + Math.abs(dvy) > WAKE_PUSH) Matter.Sleeping.set(body, false);
+  }
+
+  /** Balloon lift, fan wind and black-hole pull, on bodies and on grains. */
+  private applyFields(): void {
+    const fans = this.fans;
+    const holes = this.holes;
+    const bombs = this.bombs;
+    fans.length = 0;
+    holes.length = 0;
+    bombs.length = 0;
+
+    for (const body of this.bodies) {
+      const meta = metaOf(body);
+      if (!meta) continue;
+      if (meta.fan) fans.push(body);
+      else if (meta.hole) holes.push(body);
+      else if (meta.fuse) bombs.push(body);
+      if (meta.lift !== undefined && !body.isStatic) this.nudge(body, 0, -liftSpeed(meta.lift));
+    }
+    if (fans.length === 0 && holes.length === 0) return;
+
+    for (const fan of fans) {
+      const meta = metaOf(fan);
+      const spec = meta?.fan;
+      if (!meta || !spec) continue;
+      // A fan blows along its own "up", out of its front face.
+      const dirX = Math.sin(fan.angle);
+      const dirY = -Math.cos(fan.angle);
+      const ox = fan.position.x + (dirX * meta.h) / 2;
+      const oy = fan.position.y + (dirY * meta.h) / 2;
+      // The air column is a little wider than the fan, or a ball blown
+      // sideways drops out of it before it has gone anywhere.
+      const half = meta.w * FAN_SPREAD;
+
+      for (const body of this.bodies) {
+        if (body.isStatic) continue;
+        const dx = body.position.x - ox;
+        const dy = body.position.y - oy;
+        const f = windAt(dx * dirX + dy * dirY, dx * -dirY + dy * dirX, spec.reach, half);
+        if (f <= 0) continue;
+        const along = body.velocity.x * dirX + body.velocity.y * dirY;
+        const dv = windDelta(f, spec.strength, body.area, body.mass, along);
+        if (dv > 0) this.nudge(body, dirX * dv, dirY * dv);
+      }
+
+      this.grainWorld?.blow(ox, oy, dirX, dirY, spec.reach, half, GRAIN_WIND * spec.strength, GRAIN_AIR * spec.strength);
+    }
+
+    for (const hole of holes) {
+      const spec = metaOf(hole)?.hole;
+      if (!spec) continue;
+      const { x, y } = hole.position;
+
+      for (const body of this.bodies) {
+        if (body.isStatic || body === this.drag?.body) continue;
+        const pull = holePull(body.position.x - x, body.position.y - y, spec.reach, spec.pull, spec.swirl);
+        if (pull.x !== 0 || pull.y !== 0) this.nudge(body, pull.x, pull.y);
+      }
+
+      // `push` is outward-positive with its tangent the other way round from
+      // `holePull`'s, so both signs flip to make grains swirl the same way.
+      this.grainWorld?.push(x, y, spec.reach, -GRAIN_PULL * spec.pull, -GRAIN_SWIRL * spec.swirl);
+    }
+  }
+
+  /** Whatever reaches a black hole's core is gone: bodies and grains alike. */
+  private feedHoles(): void {
+    if (this.holes.length === 0) return;
+    let eaten = 0;
+
+    for (const hole of this.holes) {
+      const meta = metaOf(hole);
+      const spec = meta?.hole;
+      if (!meta || !spec || !this.bodies.includes(hole)) continue;
+      const { x, y } = hole.position;
+
+      let gone: Matter.Body[] | null = null;
+      for (const body of this.bodies) {
+        if (body.isStatic || body === this.drag?.body) continue;
+        const other = metaOf(body);
+        // A body is in once its middle is a quarter of its size past the rim.
+        const size = other ? Math.min(other.w, other.h) : 10;
+        const reach = spec.core + size / 4;
+        const dx = body.position.x - x;
+        const dy = body.position.y - y;
+        if (dx * dx + dy * dy < reach * reach) (gone ??= []).push(body);
+      }
+
+      // A grain is in once it overlaps the core, not once its middle is.
+      const sand = this.grainWorld;
+      const grains = sand ? sand.removeIn(x, y, spec.core + sand.options.radius) : 0;
+      if (!gone && grains === 0) continue;
+
+      for (const body of gone ?? []) {
+        const other = metaOf(body);
+        this.addEffect('gulp', x, y, Math.max(spec.core, 18), other?.color ?? meta.accent, 420);
+        this.remove(body);
+      }
+      const count = (gone?.length ?? 0) + grains;
+      spec.ate += count;
+      eaten += count;
+      meta.hitAt = this.time;
+      if (gone && this.time - this.lastGulp > GULP_COOLDOWN) {
+        this.lastGulp = this.time;
+        this.synth.gulp();
+      }
+    }
+
+    if (eaten > 0) this.emitCount();
+  }
+
+  /** Burn every fuse down a step; bombs that reach zero go off. */
+  private burnFuses(dt: number): void {
+    let due: Matter.Body[] | null = this.fused.length > 0 ? this.fused.splice(0) : null;
+
+    for (const bomb of this.bombs) {
+      const fuse = metaOf(bomb)?.fuse;
+      if (!fuse) continue;
+      fuse.left -= dt;
+      if (fuse.left <= 0 && !due?.includes(bomb)) (due ??= []).push(bomb);
+    }
+
+    if (!due) return;
+    for (const bomb of due) {
+      // A chain reaction can have removed it already.
+      if (this.bodies.includes(bomb)) this.detonate(bomb);
+    }
+    this.emitCount();
+  }
+
+  /**
+   * A bomb goes off: everything near it is thrown outward, glass and brick
+   * break, balloons pop, other bombs are set off a moment later, note blocks
+   * ring, and a crater is blown in any sand.
+   */
+  private detonate(bomb: Matter.Body): void {
+    const { x, y } = bomb.position;
+    this.remove(bomb);
+    this.addEffect('blast', x, y, BLAST_RADIUS, '#ff8a3d', 700);
+    this.synth.boom();
+
+    const breaking: Matter.Body[] = [];
+    const popping: Matter.Body[] = [];
+
+    for (const body of this.bodies) {
+      const meta = metaOf(body);
+      const dx = body.position.x - x;
+      const dy = body.position.y - y;
+      // Measure to the near side of a big body, not its middle.
+      const size = meta ? Math.min(meta.w, meta.h) / 2 : 0;
+      const dist = Math.max(0, Math.hypot(dx, dy) - size);
+      if (dist >= BLAST_RADIUS) continue;
+
+      if (meta?.kind === 'note') this.strike(body, 6);
+      if (body.isStatic) continue;
+
+      if (meta?.fuse) meta.fuse.left = Math.min(meta.fuse.left, CHAIN_MS + Math.random() * CHAIN_MS);
+      if (meta?.popsAt !== undefined) {
+        popping.push(body);
+        continue;
+      }
+
+      const speed = blastSpeed(dist, BLAST_RADIUS, BLAST_STRENGTH, body.mass);
+      const dir = direction(x, y, body.position.x, body.position.y);
+      Matter.Sleeping.set(body, false);
+      Matter.Body.setVelocity(body, {
+        x: body.velocity.x + dir.x * speed,
+        // A little extra lift, so a blast on the floor throws things up.
+        y: body.velocity.y + dir.y * speed - speed * 0.2,
+      });
+      Matter.Body.setAngularVelocity(
+        body,
+        body.angularVelocity + (Math.random() - 0.5) * 0.5 * falloff(dist, BLAST_RADIUS),
+      );
+      if (meta?.breaksAt !== undefined && speed > 4) breaking.push(body);
+    }
+
+    for (const body of popping) this.pop(body);
+    for (const body of breaking) if (this.bodies.includes(body)) this.shatter(body);
+
+    const grains = this.grainWorld;
+    if (grains && grains.count > 0) {
+      grains.removeIn(x, y, BLAST_CRATER);
+      grains.push(x, y, BLAST_RADIUS * 0.85, BLAST_GRAINS);
+    }
+  }
+
+  /** A balloon pops: gone with a bang, leaving a few scraps of rubber. */
+  private pop(body: Matter.Body): void {
+    const meta = metaOf(body);
+    if (!meta || !this.bodies.includes(body)) return;
+    const { x, y } = body.position;
+    const vx = body.velocity.x;
+    const vy = body.velocity.y;
+    this.remove(body);
+    this.addEffect('pop', x, y, meta.w * 0.75, meta.color, 260);
+    this.synth.pop();
+
+    for (let i = 0; i < 3; i++) {
+      const a = (i / 3) * Math.PI * 2 + Math.random();
+      const px = x + Math.cos(a) * meta.w * 0.25;
+      const py = y + Math.sin(a) * meta.w * 0.25;
+      const scrap = Matter.Bodies.rectangle(px, py, 9, 5, {
+        angle: Math.random() * Math.PI,
+        friction: 0.6,
+        frictionAir: 0.04,
+        restitution: 0.1,
+        density: 0.001,
+      });
+      Matter.Body.setVelocity(scrap, { x: vx + Math.cos(a) * 2.5, y: vy + Math.sin(a) * 2.5 - 1 });
+      Matter.Body.setAngularVelocity(scrap, (Math.random() - 0.5) * 0.4);
+      setMeta(scrap, {
+        toyId: meta.toyId,
+        kind: 'block',
+        color: meta.color,
+        accent: meta.accent,
+        w: 9,
+        h: 5,
+        shard: true,
+      });
+      this.add(scrap);
+    }
+    this.emitCount();
+  }
+
+  /**
+   * Throw back out whatever landed on a trampoline this step. It is done after
+   * the update because Matter's contact solver runs after `collisionStart` and
+   * would overwrite a velocity set in the handler.
+   */
+  private launchLandings(): void {
+    if (this.landings.length === 0) return;
+    for (const { body, pad, vx, vy } of this.landings) {
+      const meta = metaOf(pad);
+      const bounce = meta?.bounce;
+      if (!meta || !bounce || !this.bodies.includes(body)) continue;
+
+      const normal = { x: Math.sin(pad.angle), y: -Math.cos(pad.angle) };
+      const v = launchVelocity(normal, { x: vx, y: vy }, bounce.launch, bounce.max);
+      Matter.Sleeping.set(body, false);
+      Matter.Body.setVelocity(body, v);
+
+      if (meta.hitAt === undefined || this.time - meta.hitAt > BOING_COOLDOWN) {
+        this.synth.boing(Math.min(1, 0.35 + Math.hypot(vx, vy) / 30));
+      }
+      meta.hitAt = this.time;
+    }
+    this.landings.length = 0;
+  }
+
+  private addEffect(kind: Effect['kind'], x: number, y: number, radius: number, color: string, life: number): void {
+    this.effects.push({ kind, x, y, born: this.time, life, radius, color });
+    // A spout feeding a black hole should not be able to grow this for ever.
+    if (this.effects.length > 64) this.effects.shift();
   }
 
   // --- granular layer ----------------------------------------------------
@@ -433,6 +774,8 @@ export class ToyBoxEngine {
     view.length = 0;
 
     for (const body of this.bodies) {
+      // Grains fall into a black hole; they do not stand on it.
+      if (body.isSensor) continue;
       let collider = pool[view.length];
       if (!collider) {
         collider = {
@@ -571,7 +914,11 @@ export class ToyBoxEngine {
   private onCollision = (event: Matter.IEventCollision<Matter.Engine>): void => {
     const broken: Matter.Body[] = [];
 
+    let popped: Matter.Body[] | null = null;
+
     for (const pair of event.pairs) {
+      // A black hole is a sensor: things pass into it, they do not hit it.
+      if (pair.isSensor) continue;
       const { bodyA, bodyB } = pair;
       const impact = Matter.Vector.magnitude(
         Matter.Vector.sub(bodyA.velocity, bodyB.velocity),
@@ -580,14 +927,33 @@ export class ToyBoxEngine {
       this.strike(bodyA, impact);
       this.strike(bodyB, impact);
 
-      for (const body of [bodyA, bodyB]) {
-        const limit = metaOf(body)?.breaksAt;
-        if (limit !== undefined && impact > limit) broken.push(body);
+      for (const [body, other] of [
+        [bodyA, bodyB],
+        [bodyB, bodyA],
+      ]) {
+        const meta = metaOf(body);
+        if (!meta) continue;
+        if (meta.breaksAt !== undefined && impact > meta.breaksAt) broken.push(body);
+        if (meta.fuse && impact > BOMB_TOUCHY && !this.fused.includes(body)) this.fused.push(body);
+        if (meta.popsAt !== undefined && impact > meta.popsAt) (popped ??= []).push(body);
+        if (meta.bounce && !other.isStatic) this.land(body, other);
       }
     }
 
     for (const body of broken) this.shatter(body);
+    if (popped) for (const body of popped) this.pop(body);
   };
+
+  /** Queue a launch if `body` came down onto the springy face of `pad`. */
+  private land(pad: Matter.Body, body: Matter.Body): void {
+    const nx = Math.sin(pad.angle);
+    const ny = -Math.cos(pad.angle);
+    const above = (body.position.x - pad.position.x) * nx + (body.position.y - pad.position.y) * ny;
+    const coming = body.velocity.x * nx + body.velocity.y * ny;
+    if (above <= 0 || coming >= 0) return;
+    if (this.landings.some((l) => l.body === body)) return;
+    this.landings.push({ body, pad, vx: body.velocity.x, vy: body.velocity.y });
+  }
 
   /** Ring a note block, with a short per-block cooldown. */
   private strike(body: Matter.Body, impact: number): void {
@@ -856,6 +1222,12 @@ export class ToyBoxEngine {
       return;
     }
 
+    if (!drag.moved) {
+      const slop = TAP_SLOP * this.scale;
+      if (Math.hypot(point.x - drag.start.x, point.y - drag.start.y) < slop) return;
+      drag.moved = true;
+    }
+
     if (drag.constraint) {
       // Clamp the target so a drag can never pull a body out through a wall.
       drag.constraint.pointA = {
@@ -876,8 +1248,26 @@ export class ToyBoxEngine {
 
   private onPointerUp = (): void => {
     this.erasing = false;
-    if (this.drag) this.endDrag();
+    const drag = this.drag;
+    if (!drag) return;
+    this.endDrag();
+    // A tap on a fan or a trampoline turns it instead of moving it.
+    const turn = metaOf(drag.body)?.turn;
+    if (!drag.constraint && !drag.moved && turn) this.turn(drag.body, turn);
   };
+
+  /** Turn a static toy in place, and let anything resting on it fall. */
+  private turn(body: Matter.Body, by: number): void {
+    const before = body.bounds;
+    this.grainWorld?.wakeIn(before.min.x, before.min.y, before.max.x, before.max.y);
+    Matter.Body.setAngle(body, body.angle + by);
+    clampIntoBounds(body, this.size.w, this.size.h);
+    const after = body.bounds;
+    this.grainWorld?.wakeIn(after.min.x, after.min.y, after.max.x, after.max.y);
+    for (const other of Matter.Query.region(this.bodies, after)) {
+      if (!other.isStatic) Matter.Sleeping.set(other, false);
+    }
+  }
 
   private onPointerLeave = (): void => {
     this.pointerInside = false;
@@ -900,6 +1290,8 @@ export class ToyBoxEngine {
         body,
         constraint: null,
         offset: { x: body.position.x - point.x, y: body.position.y - point.y },
+        start: { x: point.x, y: point.y },
+        moved: false,
       };
     } else {
       const local = Matter.Vector.rotate(Matter.Vector.sub(point, body.position), -body.angle);
@@ -913,7 +1305,8 @@ export class ToyBoxEngine {
       });
       Matter.Composite.add(this.world.engine.world, constraint);
       Matter.Sleeping.set(body, false);
-      this.drag = { body, constraint, offset: { x: 0, y: 0 } };
+      // A dynamic body follows the pointer from the start: there is no tap.
+      this.drag = { body, constraint, offset: { x: 0, y: 0 }, start: point, moved: true };
     }
 
     this.setCursor('grabbing');
@@ -981,8 +1374,18 @@ export class ToyBoxEngine {
       pixelRatio: this.pixelRatio,
       useSprites: this.sprites,
       grains: this.grainWorld,
+      effects: this.liveEffects(),
     };
     this.painter.draw(scene);
+  }
+
+  /** Drop the flashes that have finished; the rest are drawn this frame. */
+  private liveEffects(): Effect[] {
+    const effects = this.effects;
+    let keep = 0;
+    for (const effect of effects) if (this.time - effect.born < effect.life) effects[keep++] = effect;
+    effects.length = keep;
+    return effects;
   }
 
   private currentGhost(): Ghost | null {
@@ -997,7 +1400,7 @@ export class ToyBoxEngine {
       w: toy.w,
       h: toy.h,
       color: toy.color,
-      shape: toy.kind === 'ball' ? 'circle' : 'rect',
+      shape: toy.swatch === 'circle' ? 'circle' : 'rect',
     };
   }
 }

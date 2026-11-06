@@ -11,7 +11,23 @@ import { shadeRgb, toRgb, type RGB } from '../../lib/color';
 import { GRAIN, MATERIALS, type GrainWorld } from '../../physics/grains';
 import { metaOf } from '../../toys/meta';
 import type { ToyMeta } from '../../toys/types';
-import type { Ghost, Scene } from '../scene';
+import {
+  balloonString,
+  bombDanger,
+  effectRings,
+  fanSpin,
+  fanStreaks,
+  fuseLeft,
+  fusePoints,
+  GADGET,
+  holeOrbits,
+  holeThrob,
+  sparkRadius,
+  trampolineDip,
+  type Orbit,
+  type Streak,
+} from '../gadgets';
+import type { Effect, Ghost, Scene } from '../scene';
 import {
   CIRCLE_STYLE,
   DOT,
@@ -110,12 +126,28 @@ export function packScene(
       case 'source':
         packSource(out, body, meta, time, glow);
         break;
+      case 'bomb':
+        packBomb(out, body, meta, time, glow);
+        break;
+      case 'balloon':
+        packBalloon(out, body, meta, time, glow);
+        break;
+      case 'fan':
+        packFan(out, body, meta, time, glow);
+        break;
+      case 'trampoline':
+        packTrampoline(out, body, meta, time, glow);
+        break;
+      case 'hole':
+        packHole(out, body, meta, time, glow);
+        break;
       default:
         packBlock(out, body, meta, glow);
         break;
     }
   }
 
+  for (const effect of scene.effects) packEffect(out, effect, time);
   if (scene.ghost) packGhost(out, scene.ghost);
 }
 
@@ -773,6 +805,243 @@ function emitEdge(
   ];
   for (const index of [0, 1, 2, 1, 3, 2]) {
     emitPolyVertex(target, corners[index][0], corners[index][1], color, alpha);
+  }
+}
+
+// --- gadgets -------------------------------------------------------------
+//
+// Same shapes as the canvas painter's gadget section, in the instance families
+// that exist: circles for anything round, rects for housings, mats and blades,
+// and poly edges for the fuse, the string and the wind (polys draw first, so a
+// line never covers a body). The animation numbers come from `gadgets.ts`.
+
+const RGB_CAP = toRgb(GADGET.bombCap);
+const RGB_FUSE = toRgb(GADGET.fuse);
+const RGB_SPARK = toRgb(GADGET.spark);
+const RGB_DANGER = toRgb(GADGET.danger);
+const RGB_WELL = toRgb(GADGET.fanWell);
+const RGB_BLADE = toRgb(GADGET.fanBlade);
+const RGB_HUB = toRgb(GADGET.fanHub);
+const RGB_FRAME = toRgb(GADGET.trampolineFrame);
+const RGB_TCAP = toRgb(GADGET.trampolineCap);
+const RGB_CORE = toRgb(GADGET.holeCore);
+const RGB_STRING = toRgb(GADGET.string);
+
+/** A body-frame point, in world px. */
+function toWorldPoint(body: Matter.Body, x: number, y: number): [number, number] {
+  const c = Math.cos(body.angle);
+  const s = Math.sin(body.angle);
+  return [body.position.x + x * c - y * s, body.position.y + x * s + y * c];
+}
+
+function emitLine(
+  target: Instances,
+  points: { x: number; y: number }[],
+  map: (x: number, y: number) => [number, number],
+  halfWidth: number,
+  color: RGB,
+  alpha: number,
+): void {
+  let [ax, ay] = map(points[0].x, points[0].y);
+  for (let i = 1; i < points.length; i++) {
+    const [bx, by] = map(points[i].x, points[i].y);
+    emitEdge(target, ax, ay, bx, by, halfWidth, color, alpha);
+    ax = bx;
+    ay = by;
+  }
+}
+
+function packBomb(out: SceneBuffers, body: Matter.Body, meta: ToyMeta, time: number, glow: number): void {
+  const r = body.circleRadius ?? meta.w / 2;
+  const points = fusePoints(r, fuseLeft(meta));
+  const inBody = (x: number, y: number) => toWorldPoint(body, x, y);
+  emitLine(out.polys, points, inBody, 1, RGB_FUSE, 1);
+
+  placeRect(out, body, 0, -r - 3, rect({ x: 0, y: 0, halfW: 5, halfH: 4, radius: 2, color: RGB_CAP, glow }));
+
+  const color = toRgb(meta.color);
+  pushCircle(out, body.position.x, body.position.y, r, color, 1, shadeRgb(color, BALL_BORDER), 1, glow);
+
+  const danger = bombDanger(meta, time);
+  if (danger > 0) {
+    // Flat (the liquid path) so the sheen is not painted twice.
+    pushCircle(out, body.position.x, body.position.y, r * 0.86, RGB_DANGER, danger * 0.55, null, 0, 0, 0, 1, 1);
+  }
+
+  const tip = points[points.length - 1];
+  const [sx, sy] = inBody(tip.x, tip.y);
+  // The halo is a soft flat disc: a small `glow` value leaves a visible square
+  // at the edge of the quad, because the falloff has not reached zero there.
+  const spark = sparkRadius(time);
+  pushCircle(out, sx, sy, spark * 2.6, RGB_SPARK, 0.35, null, 0, 0, 0, 1, 1);
+  pushCircle(out, sx, sy, spark, RGB_SPARK, 1, null, 0);
+}
+
+function packBalloon(out: SceneBuffers, body: Matter.Body, meta: ToyMeta, time: number, glow: number): void {
+  const r = body.circleRadius ?? meta.w / 2;
+  const { x, y } = body.position;
+  // Screen frame, not the body's: a balloon's string always hangs down.
+  const inScreen = (px: number, py: number): [number, number] => [x + px, y + py];
+  emitLine(out.polys, balloonString(r, time, body.id, body.velocity.x), inScreen, 0.6, RGB_STRING, 0.8);
+
+  const color = toRgb(meta.color);
+  const knot = shadeRgb(color, -0.25);
+  emitPolyVertex(out.polys, x - 3.5, y + r + 4, knot, 1);
+  emitPolyVertex(out.polys, x + 3.5, y + r + 4, knot, 1);
+  emitPolyVertex(out.polys, x, y + r - 1, knot, 1);
+
+  pushCircle(out, x, y, r, color, 1, shadeRgb(color, BALL_BORDER), 1, glow);
+}
+
+const STREAKS: Streak[] = [];
+
+function packFan(out: SceneBuffers, body: Matter.Body, meta: ToyMeta, time: number, glow: number): void {
+  const { w, h } = meta;
+  const spec = meta.fan;
+  const color = toRgb(meta.color);
+  const accent = toRgb(meta.accent);
+  const inBody = (x: number, y: number) => toWorldPoint(body, x, y);
+
+  for (const streak of fanStreaks(time, w * 1.3, spec?.reach ?? 300, STREAKS)) {
+    const y0 = -h / 2 - streak.along;
+    const [ax, ay] = inBody(streak.across, y0);
+    const [bx, by] = inBody(streak.across, y0 - streak.length);
+    emitEdge(out.polys, ax, ay, bx, by, 1.2, accent, streak.alpha);
+  }
+
+  placeRect(
+    out,
+    body,
+    0,
+    0,
+    rect({
+      x: 0,
+      y: 0,
+      halfW: w / 2,
+      halfH: h / 2,
+      radius: 8,
+      color,
+      shadeTop: 0.3,
+      shadeBottom: -0.4,
+      border: shadeRgb(color, -0.6),
+      borderW: 1.5,
+      glow,
+    }),
+  );
+  placeRect(out, body, 0, -h / 2 + 3.5, rect({ x: 0, y: 0, halfW: w / 2 - 6, halfH: 1.5, radius: 1.5, color: accent, alpha: 0.85 }));
+
+  const wellR = h / 2 - 4;
+  placeRect(out, body, 0, 2, rect({ x: 0, y: 0, halfW: wellR, halfH: wellR, radius: wellR, color: RGB_WELL }));
+
+  // Blades: each a rounded bar from the hub outwards, at its own angle.
+  const spin = fanSpin(time, spec?.strength ?? 1);
+  const [hx, hy] = inBody(0, 2);
+  const bladeLen = wellR - 2;
+  for (let k = 0; k < 3; k++) {
+    const a = body.angle + spin + (k * Math.PI * 2) / 3;
+    // Local "up" of the blade, rotated by `a`: the bar's centre is half a blade out.
+    const cx = hx + Math.sin(a) * (bladeLen / 2);
+    const cy = hy - Math.cos(a) * (bladeLen / 2);
+    pushRect(out.rects, rect({ x: cx, y: cy, halfW: 2.6, halfH: bladeLen / 2, radius: 2.6, angle: a, color: RGB_BLADE }));
+  }
+  pushCircle(out, hx, hy, 3.2, RGB_HUB, 1, null, 0);
+}
+
+function packTrampoline(out: SceneBuffers, body: Matter.Body, meta: ToyMeta, time: number, glow: number): void {
+  const { w, h } = meta;
+  const dip = trampolineDip(meta, time);
+  const flash = Math.max(0, dip);
+  const color = toRgb(meta.color);
+  const inBody = (x: number, y: number) => toWorldPoint(body, x, y);
+
+  placeRect(
+    out,
+    body,
+    0,
+    0,
+    rect({
+      x: 0,
+      y: 0,
+      halfW: w / 2,
+      halfH: h / 2,
+      radius: h / 2,
+      color: RGB_FRAME,
+      border: shadeRgb(RGB_FRAME, -0.5),
+      borderW: 1.5,
+      glow,
+    }),
+  );
+
+  // Springs: thin rects, not poly edges - polys draw before rects, so an edge
+  // would vanish under the frame.
+  for (let x = -w / 2 + 16; x <= w / 2 - 16; x += 10) {
+    const [ax, ay] = inBody(x - 2, h / 2 - 3);
+    const [bx, by] = inBody(x + 2, -h / 2 + 7);
+    pushRect(
+      out.rects,
+      rect({
+        x: (ax + bx) / 2,
+        y: (ay + by) / 2,
+        halfW: 0.6,
+        halfH: Math.hypot(bx - ax, by - ay) / 2,
+        angle: Math.atan2(bx - ax, -(by - ay)),
+        color: RGB_TCAP,
+        alpha: 0.55,
+      }),
+    );
+  }
+
+  placeRect(
+    out,
+    body,
+    0,
+    -h / 2 + 4 + dip * 4,
+    rect({ x: 0, y: 0, halfW: w / 2 - 8, halfH: 3, radius: 3, color: shadeRgb(color, 0.1 * flash), glow: Math.max(glow, flash) }),
+  );
+
+  for (const side of [-1, 1]) {
+    const [cx, cy] = inBody(side * (w / 2 - h / 2), 0);
+    pushCircle(out, cx, cy, h / 2 - 2, RGB_TCAP, 1, shadeRgb(RGB_TCAP, -0.5), 1);
+  }
+}
+
+const ORBITS: Orbit[] = [];
+
+function packHole(out: SceneBuffers, body: Matter.Body, meta: ToyMeta, time: number, glow: number): void {
+  const r = meta.w / 2;
+  const { x, y } = body.position;
+  const accent = toRgb(meta.accent);
+  const throb = holeThrob(meta, time);
+
+  if (meta.hole) pushCircle(out, x, y, meta.hole.reach, accent, 0, accent, 0.1, 0, 22);
+  // The halo: a soft flat disc in the accent colour, under everything else.
+  pushCircle(out, x, y, r * 2.4, accent, 0.4 + 0.25 * throb, null, 0, 0, 0, 1, 1);
+
+  for (const orbit of holeOrbits(time, r, ORBITS)) {
+    pushCircle(out, x + orbit.x, y + orbit.y, orbit.radius, accent, orbit.alpha, null, 0, 0, 0, 1, 1);
+  }
+
+  // The core: flat black (the liquid path has no sheen), then a lit rim as an
+  // outline-only circle, which also carries the drag highlight.
+  const core = r * (1 + 0.12 * throb);
+  pushCircle(out, x, y, core / 1.1, RGB_CORE, 1, null, 0, 0, 0, 1, 1);
+  pushCircle(out, x, y, core, accent, 0, accent, 0.9, glow);
+}
+
+function packEffect(out: SceneBuffers, effect: Effect, time: number): void {
+  const ring = effectRings(effect, time);
+  if (ring.alpha <= 0) return;
+  const color = toRgb(effect.color);
+
+  if (ring.flash > 0) {
+    const r = effect.radius * 0.45 * (0.6 + ring.flash * 0.4);
+    pushCircle(out, effect.x, effect.y, r, RGB_SPARK, ring.flash * 0.5, null, 0, 0, 0, 1, 1);
+  }
+
+  // A circle's outline is 1.5 px; a blast is drawn as three of them.
+  const rings = effect.kind === 'blast' ? 3 : 1;
+  for (let i = 0; i < rings; i++) {
+    pushCircle(out, effect.x, effect.y, Math.max(1, ring.radius - i * 1.3), color, 0, color, ring.alpha);
   }
 }
 

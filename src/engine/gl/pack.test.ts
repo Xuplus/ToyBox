@@ -1,4 +1,4 @@
-import type Matter from 'matter-js';
+import Matter from 'matter-js';
 import { describe, expect, it } from 'vitest';
 import { toRgb, shadeRgb } from '../../lib/color';
 import { GRAIN, GrainWorld, MATERIALS, scatterGrains } from '../../physics/grains';
@@ -35,6 +35,7 @@ function scene(bodies: Matter.Body[], extra: Partial<Scene> = {}): Scene {
     draggingId: null,
     ghost: null,
     grains: null,
+    effects: [],
     scale: 1,
     pixelRatio: 1,
     useSprites: true,
@@ -422,5 +423,87 @@ describe('Instances', () => {
     list.slot();
     list.slot();
     expect(list.view().length).toBe(8);
+  });
+});
+
+describe('packScene — gadgets', () => {
+  function everyFloatFinite(out: SceneBuffers): boolean {
+    for (const list of [out.circles, out.styles, out.rects, out.polys]) {
+      for (const value of list.view()) if (!Number.isFinite(value)) return false;
+    }
+    return true;
+  }
+
+  it('draws every gadget with finite numbers, at any angle and time', () => {
+    for (const id of ['bomb', 'balloon', 'fan', 'trampoline', 'blackHole'] as const) {
+      for (const angle of [0, Math.PI / 4, Math.PI]) {
+        const body = make(id, 300, 200);
+        Matter.Body.setAngle(body, angle);
+        for (const time of [0, 1234, 98765]) {
+          const out = pack([body], { time });
+          expect(out.circles.count + out.rects.count + out.polys.count).toBeGreaterThan(0);
+          expect(everyFloatFinite(out)).toBe(true);
+        }
+      }
+    }
+  });
+
+  it('a bomb is a circle with a cap, a fuse and a spark', () => {
+    const out = pack([make('bomb', 100, 100)]);
+    expect(out.rects.count).toBe(1);
+    // ball + spark halo + spark; no red flash on a fresh fuse
+    expect(out.circles.count).toBe(3);
+    expect(out.polys.count).toBeGreaterThan(0);
+  });
+
+  it('a bomb flashes red once its fuse is mostly burnt', () => {
+    const bomb = make('bomb', 100, 100);
+    const fresh = pack([bomb]).circles.count;
+    metaOf(bomb)!.fuse!.left = 200;
+    // try a few moments: the blink can be at its dim point on any one frame
+    const counts = [0, 40, 80].map((time) => pack([bomb], { time }).circles.count);
+    expect(Math.max(...counts)).toBe(fresh + 1);
+  });
+
+  it('a balloon string hangs down even when the balloon is upside down', () => {
+    const balloon = make('balloon', 100, 100);
+    Matter.Body.setAngle(balloon, Math.PI);
+    const out = pack([balloon]);
+    const d = out.polys.data;
+    let lowest = -Infinity;
+    for (let i = 0; i < out.polys.count; i++) lowest = Math.max(lowest, d[i * out.polys.stride + 1]);
+    expect(lowest).toBeGreaterThan(100 + 22);
+  });
+
+  it('a fan blows out of its front face: streaks are in front, not behind', () => {
+    const fan = make('fan', 300, 300);
+    const out = pack([fan], { time: 500 });
+    const d = out.polys.data;
+    for (let i = 0; i < out.polys.count; i++) expect(d[i * out.polys.stride + 1]).toBeLessThan(300);
+
+    Matter.Body.setAngle(fan, Math.PI / 2);
+    const turned = pack([fan], { time: 500 });
+    const t = turned.polys.data;
+    for (let i = 0; i < turned.polys.count; i++) expect(t[i * turned.polys.stride]).toBeGreaterThan(300);
+  });
+
+  it('a trampoline mat dips and glows right after a landing', () => {
+    const pad = make('trampoline', 300, 300);
+    const meta = metaOf(pad)!;
+    const matOf = (out: SceneBuffers) => rectAt(out.rects, out.rects.count - 1);
+
+    const still = matOf(pack([pad], { time: 1000 }));
+    meta.hitAt = 1000;
+    const hit = matOf(pack([pad], { time: 1010 }));
+    expect(hit.y).toBeGreaterThan(still.y);
+    expect(hit.glow).toBeGreaterThan(0);
+  });
+
+  it('effects are drawn while they last and not after', () => {
+    const blast = { kind: 'blast' as const, x: 50, y: 60, born: 0, life: 700, radius: 200, color: '#ff8a3d' };
+    expect(pack([], { effects: [blast], time: 100 }).circles.count).toBe(4);
+    expect(pack([], { effects: [blast], time: 700 }).circles.count).toBe(0);
+    const pop = { ...blast, kind: 'pop' as const, life: 260, radius: 30 };
+    expect(pack([], { effects: [pop], time: 100 }).circles.count).toBe(1);
   });
 });

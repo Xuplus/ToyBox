@@ -3,7 +3,23 @@ import { alpha, shade } from '../lib/color';
 import { MATERIALS, type GrainWorld } from '../physics/grains';
 import { metaOf } from '../toys/meta';
 import type { ToyMeta } from '../toys/types';
-import type { Ghost, Painter, Scene } from './scene';
+import {
+  balloonString,
+  bombDanger,
+  effectRings,
+  fanSpin,
+  fanStreaks,
+  fuseLeft,
+  fusePoints,
+  GADGET,
+  holeOrbits,
+  holeThrob,
+  sparkRadius,
+  trampolineDip,
+  type Orbit,
+  type Streak,
+} from './gadgets';
+import type { Effect, Ghost, Painter, Scene } from './scene';
 import { ballSprite, resetSprites } from './sprites';
 
 /** The hopper housing, shared with the WebGL painter. */
@@ -75,6 +91,7 @@ export function renderScene(ctx: CanvasRenderingContext2D, input: Scene, grid: P
     }
   }
 
+  if (input.effects.length > 0) drawEffects(ctx, input.effects, input.time);
   if (input.ghost) drawGhost(ctx, input.ghost);
   drawFrame(ctx, width, height, scale);
 }
@@ -263,6 +280,25 @@ function drawBody(
       ctx.rotate(body.angle);
       drawSource(ctx, meta, time);
       break;
+    case 'bomb':
+      ctx.rotate(body.angle);
+      drawBomb(ctx, body, meta, time);
+      break;
+    case 'balloon':
+      // A balloon never turns: its string always hangs down.
+      drawBalloon(ctx, body, meta, time);
+      break;
+    case 'fan':
+      ctx.rotate(body.angle);
+      drawFan(ctx, meta, time);
+      break;
+    case 'trampoline':
+      ctx.rotate(body.angle);
+      drawTrampoline(ctx, meta, time);
+      break;
+    case 'hole':
+      drawHole(ctx, meta, time);
+      break;
     default:
       // Polygons are drawn from their world vertices, so no extra rotation.
       if (meta.shape !== 'poly') ctx.rotate(body.angle);
@@ -274,12 +310,21 @@ function drawBody(
 }
 
 function drawBall(ctx: CanvasRenderingContext2D, body: Matter.Body, meta: ToyMeta): void {
-  const r = body.circleRadius ?? meta.w / 2;
+  drawShiny(ctx, 0, 0, body.circleRadius ?? meta.w / 2, meta.color);
+}
 
+/**
+ * A lit sphere: the look every circle has on the WebGL path. The light is
+ * always top left on screen, so pass `angle` when the context is rotated.
+ */
+function drawShiny(ctx: CanvasRenderingContext2D, x: number, y: number, r: number, color: string, angle = 0): void {
+  ctx.save();
+  ctx.translate(x, y);
+  if (angle !== 0) ctx.rotate(-angle);
   const fill = ctx.createRadialGradient(-r * 0.35, -r * 0.4, r * 0.1, 0, 0, r * 1.05);
-  fill.addColorStop(0, shade(meta.color, 0.55));
-  fill.addColorStop(0.55, meta.color);
-  fill.addColorStop(1, shade(meta.color, -0.45));
+  fill.addColorStop(0, shade(color, 0.55));
+  fill.addColorStop(0.55, color);
+  fill.addColorStop(1, shade(color, -0.45));
 
   ctx.beginPath();
   ctx.arc(0, 0, r, 0, Math.PI * 2);
@@ -287,7 +332,7 @@ function drawBall(ctx: CanvasRenderingContext2D, body: Matter.Body, meta: ToyMet
   ctx.fill();
 
   ctx.lineWidth = 1.5;
-  ctx.strokeStyle = shade(meta.color, -0.55);
+  ctx.strokeStyle = shade(color, -0.55);
   ctx.stroke();
 
   // Specular highlight, always top-left (balls don't rotate their shading).
@@ -298,6 +343,7 @@ function drawBall(ctx: CanvasRenderingContext2D, body: Matter.Body, meta: ToyMet
   ctx.beginPath();
   ctx.arc(0, 0, r, 0, Math.PI * 2);
   ctx.fill();
+  ctx.restore();
 }
 
 /** Wedges and other non-rectangular bodies: the path comes from world vertices. */
@@ -613,6 +659,231 @@ function drawNote(ctx: CanvasRenderingContext2D, meta: ToyMeta, time: number): v
     ctx.fillStyle = 'rgba(10, 12, 18, 0.78)';
     ctx.fillText(meta.label, 0, 1);
   }
+}
+
+// --- gadgets -------------------------------------------------------------
+
+function strokePoints(ctx: CanvasRenderingContext2D, points: { x: number; y: number }[]): void {
+  ctx.beginPath();
+  ctx.moveTo(points[0].x, points[0].y);
+  for (let i = 1; i < points.length; i++) ctx.lineTo(points[i].x, points[i].y);
+  ctx.stroke();
+}
+
+function drawBomb(ctx: CanvasRenderingContext2D, body: Matter.Body, meta: ToyMeta, time: number): void {
+  const r = body.circleRadius ?? meta.w / 2;
+  const left = fuseLeft(meta);
+
+  // Fuse first, so the cap covers its root.
+  const points = fusePoints(r, left);
+  ctx.strokeStyle = GADGET.fuse;
+  ctx.lineWidth = 2;
+  ctx.lineCap = 'round';
+  strokePoints(ctx, points);
+
+  ctx.fillStyle = GADGET.bombCap;
+  roundedRect(ctx, -5, -r - 7, 10, 8, 2);
+  ctx.fill();
+
+  drawShiny(ctx, 0, 0, r, meta.color, body.angle);
+
+  const danger = bombDanger(meta, time);
+  if (danger > 0) {
+    ctx.beginPath();
+    ctx.arc(0, 0, r, 0, Math.PI * 2);
+    ctx.fillStyle = alpha(GADGET.danger, danger * 0.55);
+    ctx.fill();
+  }
+
+  const tip = points[points.length - 1];
+  const spark = sparkRadius(time);
+  const halo = ctx.createRadialGradient(tip.x, tip.y, 0, tip.x, tip.y, spark * 3);
+  halo.addColorStop(0, alpha(GADGET.spark, 0.35));
+  halo.addColorStop(1, alpha(GADGET.spark, 0));
+  ctx.fillStyle = halo;
+  ctx.beginPath();
+  ctx.arc(tip.x, tip.y, spark * 3, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = GADGET.spark;
+  ctx.beginPath();
+  ctx.arc(tip.x, tip.y, spark, 0, Math.PI * 2);
+  ctx.fill();
+}
+
+function drawBalloon(ctx: CanvasRenderingContext2D, body: Matter.Body, meta: ToyMeta, time: number): void {
+  const r = body.circleRadius ?? meta.w / 2;
+
+  ctx.strokeStyle = alpha(GADGET.string, 0.8);
+  ctx.lineWidth = 1.2;
+  strokePoints(ctx, balloonString(r, time, body.id, body.velocity.x));
+
+  // The knot: a little tuck under the bottom.
+  ctx.fillStyle = shade(meta.color, -0.25);
+  ctx.beginPath();
+  ctx.moveTo(-3.5, r + 4);
+  ctx.lineTo(3.5, r + 4);
+  ctx.lineTo(0, r - 1);
+  ctx.closePath();
+  ctx.fill();
+
+  drawBall(ctx, body, meta);
+}
+
+const STREAKS: Streak[] = [];
+
+function drawFan(ctx: CanvasRenderingContext2D, meta: ToyMeta, time: number): void {
+  const { w, h } = meta;
+  const spec = meta.fan;
+  const strength = spec?.strength ?? 1;
+
+  // Wind first, under the housing: thin streaks running out of the front face.
+  ctx.lineCap = 'round';
+  ctx.lineWidth = 2.4;
+  for (const streak of fanStreaks(time, w * 1.3, spec?.reach ?? 300, STREAKS)) {
+    ctx.strokeStyle = alpha(meta.accent, streak.alpha);
+    ctx.beginPath();
+    ctx.moveTo(streak.across, -h / 2 - streak.along);
+    ctx.lineTo(streak.across, -h / 2 - streak.along - streak.length);
+    ctx.stroke();
+  }
+
+  const fill = ctx.createLinearGradient(0, -h / 2, 0, h / 2);
+  fill.addColorStop(0, shade(meta.color, 0.3));
+  fill.addColorStop(1, shade(meta.color, -0.4));
+  roundedRect(ctx, -w / 2, -h / 2, w, h, 8);
+  ctx.fillStyle = fill;
+  ctx.fill();
+  ctx.strokeStyle = shade(meta.color, -0.6);
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+
+  // The front face: a lit grille, so you can see which way it blows.
+  ctx.fillStyle = alpha(meta.accent, 0.85);
+  roundedRect(ctx, -w / 2 + 6, -h / 2 + 2, w - 12, 3, 1.5);
+  ctx.fill();
+
+  // Rotor in a round well.
+  const wellR = h / 2 - 4;
+  ctx.fillStyle = GADGET.fanWell;
+  ctx.beginPath();
+  ctx.arc(0, 2, wellR, 0, Math.PI * 2);
+  ctx.fill();
+
+  const spin = fanSpin(time, strength);
+  ctx.fillStyle = GADGET.fanBlade;
+  for (let k = 0; k < 3; k++) {
+    ctx.save();
+    ctx.translate(0, 2);
+    ctx.rotate(spin + (k * Math.PI * 2) / 3);
+    roundedRect(ctx, -2.6, -wellR + 2, 5.2, wellR - 2, 2.6);
+    ctx.fill();
+    ctx.restore();
+  }
+  ctx.fillStyle = GADGET.fanHub;
+  ctx.beginPath();
+  ctx.arc(0, 2, 3.2, 0, Math.PI * 2);
+  ctx.fill();
+}
+
+function drawTrampoline(ctx: CanvasRenderingContext2D, meta: ToyMeta, time: number): void {
+  const { w, h } = meta;
+  const dip = trampolineDip(meta, time);
+  const flash = Math.max(0, dip);
+
+  ctx.fillStyle = GADGET.trampolineFrame;
+  roundedRect(ctx, -w / 2, -h / 2, w, h, h / 2);
+  ctx.fill();
+  ctx.strokeStyle = shade(GADGET.trampolineFrame, -0.5);
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+
+  // Springs: short slanted ticks under the mat.
+  ctx.strokeStyle = alpha(GADGET.trampolineCap, 0.55);
+  ctx.lineWidth = 1.2;
+  ctx.beginPath();
+  for (let x = -w / 2 + 16; x <= w / 2 - 16; x += 10) {
+    ctx.moveTo(x - 2, h / 2 - 3);
+    ctx.lineTo(x + 2, -h / 2 + 7);
+  }
+  ctx.stroke();
+
+  // The mat, pressed in by the last landing.
+  ctx.save();
+  if (flash > 0) {
+    ctx.shadowColor = alpha(meta.color, 0.95);
+    ctx.shadowBlur = 22 * flash;
+  }
+  ctx.fillStyle = shade(meta.color, 0.1 * flash);
+  roundedRect(ctx, -w / 2 + 8, -h / 2 + 1 + dip * 4, w - 16, 6, 3);
+  ctx.fill();
+  ctx.restore();
+
+  for (const side of [-1, 1]) drawShiny(ctx, side * (w / 2 - h / 2), 0, h / 2 - 2, GADGET.trampolineCap);
+}
+
+const ORBITS: Orbit[] = [];
+
+function drawHole(ctx: CanvasRenderingContext2D, meta: ToyMeta, time: number): void {
+  const r = meta.w / 2;
+  const spec = meta.hole;
+  const throb = holeThrob(meta, time);
+
+  // Where it reaches, very faint, so a player can see the pull is a place.
+  if (spec) {
+    ctx.save();
+    ctx.setLineDash([10, 12]);
+    ctx.strokeStyle = alpha(meta.accent, 0.1);
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.arc(0, 0, spec.reach, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  const halo = ctx.createRadialGradient(0, 0, r * 0.6, 0, 0, r * 3.2);
+  halo.addColorStop(0, alpha(meta.accent, 0.45 + 0.3 * throb));
+  halo.addColorStop(1, alpha(meta.accent, 0));
+  ctx.fillStyle = halo;
+  ctx.beginPath();
+  ctx.arc(0, 0, r * 3.2, 0, Math.PI * 2);
+  ctx.fill();
+
+  for (const orbit of holeOrbits(time, r, ORBITS)) {
+    ctx.fillStyle = alpha(meta.accent, orbit.alpha);
+    ctx.beginPath();
+    ctx.arc(orbit.x, orbit.y, orbit.radius, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  ctx.fillStyle = GADGET.holeCore;
+  ctx.beginPath();
+  ctx.arc(0, 0, r * (1 + 0.12 * throb), 0, Math.PI * 2);
+  ctx.fill();
+  ctx.strokeStyle = alpha(meta.accent, 0.9);
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+}
+
+function drawEffects(ctx: CanvasRenderingContext2D, effects: Effect[], time: number): void {
+  ctx.save();
+  for (const effect of effects) {
+    const ring = effectRings(effect, time);
+    if (ring.alpha <= 0) continue;
+
+    if (ring.flash > 0) {
+      ctx.fillStyle = alpha(GADGET.spark, ring.flash * 0.5);
+      ctx.beginPath();
+      ctx.arc(effect.x, effect.y, effect.radius * 0.45 * (0.6 + ring.flash * 0.4), 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    ctx.strokeStyle = alpha(effect.color, ring.alpha);
+    ctx.lineWidth = effect.kind === 'blast' ? 4 : 2;
+    ctx.beginPath();
+    ctx.arc(effect.x, effect.y, ring.radius, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+  ctx.restore();
 }
 
 function drawGhost(ctx: CanvasRenderingContext2D, ghost: Ghost): void {

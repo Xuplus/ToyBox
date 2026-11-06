@@ -244,6 +244,11 @@ const POOL_STILL = 0.95;
  *  px/step. A pool is never perfectly still, so this is a real disturbance. */
 const FLUID_WAKE = 1;
 
+/** A push (px/step) a sleeping grain ignores: about one step of gravity. Its
+ *  neighbours and the friction cone already carry that much, so anything
+ *  weaker could not move it - waking it would only cost a sleep window. */
+const PUSH_WAKE = 0.3;
+
 /**
  * A grain woken only to check its support gets this many steps to show that it
  * has lost it. Free fall covers ~9 px in 8 steps; a grain that is still held up
@@ -750,6 +755,96 @@ export class GrainWorld {
     }
 
     return removed;
+  }
+
+  /**
+   * Change the speed of every grain within `radius` of a point: `outward` along
+   * the line from the centre (negative pulls in), `swirl` across it, both at
+   * full strength in the middle and fading linearly to nothing at the edge.
+   * A bomb is one call with a large `outward`; a black hole is one call per
+   * step with a small negative one.
+   *
+   * A sleeper is only woken by a push that could actually move it - more than
+   * `PUSH_WAKE` - so a faint pull at the edge of the range does not keep a
+   * settled pile awake for ever. Returns how many grains were pushed.
+   */
+  push(centerX: number, centerY: number, radius: number, outward: number, swirl = 0): number {
+    if (radius <= 0 || (outward === 0 && swirl === 0)) return 0;
+    const { x, y, vx, vy, asleep } = this;
+    const r2 = radius * radius;
+    let pushed = 0;
+
+    for (let i = 0; i < this.count; i++) {
+      const dx = x[i] - centerX;
+      const dy = y[i] - centerY;
+      const d2 = dx * dx + dy * dy;
+      if (d2 >= r2) continue;
+      const d = Math.sqrt(d2);
+      const f = 1 - d / radius;
+      const along = outward * f;
+      const across = swirl * f;
+      if (asleep[i] === 1) {
+        if (Math.abs(along) + Math.abs(across) < PUSH_WAKE) continue;
+        this.wake(i);
+        this.markDirty(x[i], y[i]);
+      }
+      const nx = d > 1e-6 ? dx / d : 0;
+      const ny = d > 1e-6 ? dy / d : -1;
+      vx[i] += nx * along - ny * across;
+      vy[i] += ny * along + nx * across;
+      pushed++;
+    }
+
+    return pushed;
+  }
+
+  /**
+   * Wind: speed added along (`dirX`, `dirY`, a unit vector) to every grain in a
+   * column that starts at a point, runs `reach` px and is `halfWidth` either
+   * side, widening as it goes. Strength fades to nothing at the far end. The
+   * shape is `windAt` in `fields.ts`; it is repeated here so the solver stays
+   * free of imports and the loop stays flat.
+   *
+   * `top` is the speed of the air itself: wind only brings a grain up to it
+   * (`top * f` where the column has faded), it does not keep accelerating it.
+   */
+  blow(
+    originX: number,
+    originY: number,
+    dirX: number,
+    dirY: number,
+    reach: number,
+    halfWidth: number,
+    strength: number,
+    top = Infinity,
+  ): number {
+    if (reach <= 0 || strength <= 0) return 0;
+    const { x, y, vx, vy, asleep } = this;
+    let pushed = 0;
+
+    for (let i = 0; i < this.count; i++) {
+      const dx = x[i] - originX;
+      const dy = y[i] - originY;
+      const along = dx * dirX + dy * dirY;
+      if (along < 0 || along > reach) continue;
+      const t = along / reach;
+      const width = halfWidth * (1 + 0.5 * t);
+      const side = Math.abs(dx * -dirY + dy * dirX);
+      if (side >= width) continue;
+      const f = (1 - t) * Math.min(1, (width - side) / (width * 0.35));
+      const dv = Math.min(strength * f, top * f - (vx[i] * dirX + vy[i] * dirY));
+      if (dv <= 0) continue;
+      if (asleep[i] === 1) {
+        if (dv < PUSH_WAKE) continue;
+        this.wake(i);
+        this.markDirty(x[i], y[i]);
+      }
+      vx[i] += dirX * dv;
+      vy[i] += dirY * dv;
+      pushed++;
+    }
+
+    return pushed;
   }
 
   /** How many grains of this material are in the box. */

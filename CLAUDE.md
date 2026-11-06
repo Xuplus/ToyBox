@@ -8,8 +8,9 @@ Context for AI agents working in this repo. Keep this file short; see
 
 A **2D physics sandbox**: a box you drop toys into and knock about. Balls with
 different weight and bounciness, blocks (some shatter on impact), conveyor
-belts, ball spouts that keep feeding the box, and musical blocks that play a note
-when something hits them. You can grab anything with the mouse and throw it.
+belts, ball spouts that keep feeding the box, musical blocks that play a note
+when something hits them, sand and water, and five gadgets: a bomb, a balloon, a
+fan, a trampoline and a black hole. You can grab anything with the mouse and throw it.
 Nothing is stored and nothing is uploaded — the whole simulation runs on the
 device.
 
@@ -46,13 +47,17 @@ bundle served by Caddy**, and the `/toybox` prefix is baked into the build via
     body. Mutation lives in the engine.
   - `spawner.ts` — pure emission schedule for the ball spout: how many balls are
     owed this step, and what carries to the next one (burst-capped).
+  - `fields.ts` — the gadgets' maths: blast falloff and speed, the fan's wind
+    column and `windDelta`, the black hole's pull, the trampoline's launch, a
+    balloon's lift. Pure numbers in Matter units; the engine only loops.
 - `src/toys/` — the **toy registry**. `catalog.ts` is the one file to edit to add
   a toy: each `ToyDef` knows its palette metadata and how to build its Matter
   body. `meta.ts` keeps per-body metadata (colour, belt speed, break threshold,
   pitch, spawner rate) in a `WeakMap`.
 - `src/engine/` — `ToyBoxEngine.ts` owns the RAF loop, pointer input
-  (spawn / drag / delete), collision handling (note strikes, shattering), the
-  spawners, the playfield scale and body limits. Drawing goes through a
+  (spawn / drag / delete / tap to turn), collision handling (note strikes,
+  shattering, bombs, balloons, trampolines), the spawners, the gadgets (the
+  section of that name), the playfield scale and body limits. Drawing goes through a
   **`Painter`** (`scene.ts`): `createPainter` gives the engine a WebGL2 painter
   if the browser will provide one and the canvas 2D painter otherwise.
 - `src/engine/gl/` — the default painter. `pack.ts` turns a `Scene` into flat
@@ -61,6 +66,10 @@ bundle served by Caddy**, and the `/toybox` prefix is baked into the build via
   `shaders.ts` holds the GLSL; the layouts in `instances.ts` are the contract
   with it. `labels.ts` is the note-name texture atlas. It is pure enough to unit
   test — `pack.test.ts` never creates a GL context.
+- `src/engine/gadgets.ts` — how the gadgets look, as numbers: colours, the fuse
+  burning down, fan blades and wind streaks, the trampoline's dip, the specks
+  falling into a black hole, and the rings of the blast/pop/gulp `Effect`s.
+  Both painters read it, so they animate the same way.
 - `src/engine/render.ts` — the canvas 2D painter: one body at a time, real
   paths and gradients. It is the fallback (`?render=2d`) and the reference the
   instanced path is checked against, so a change to the look usually lands in
@@ -86,7 +95,8 @@ bundle served by Caddy**, and the `/toybox` prefix is baked into the build via
   needs none of this.
 - `src/debug.ts` — the `?bench=N` hook. Not part of the toy: see below.
 - `src/audio/` — `notes.ts` (scale + note naming, pure) and `synth.ts` (a tiny
-  WebAudio synth — every sound is generated, no audio files).
+  WebAudio synth — every sound is generated, no audio files: notes, crack,
+  boom, pop, boing, gulp).
 - `src/ui/` — `TopBar` (home, pause, mute, clear, language) and `Palette`.
 - `src/i18n.ts` — EN/ES, auto-detected, with a toggle. Matches the siblings.
 
@@ -214,6 +224,24 @@ Always run `npm run typecheck` and `npm run test` after changes.
   (`aLiquid` in `shaders.ts`), which is what makes a cluster read as one body of
   water. The coupling to rigid bodies is still `dragImpulse`: there is no
   buoyancy, so a beach ball sinks.
+- **A gadget is a change of speed, applied as a force before the update.**
+  `nudge()` turns px/step into the force Matter integrates with gravity, so
+  lift, wind and pull all live on the one clock and a paused box stops them.
+  Never `setVelocity` from a field every step. Two exceptions, both one-off
+  events: a blast sets the speed it throws things at, and a trampoline launch
+  is queued in `collisionStart` and applied *after* `Engine.update` - Matter's
+  contact solver runs after that event and would overwrite it.
+- **Wind is drag towards the air's speed** (`windDelta`, `WIND_TOP`), never a
+  constant push: a constant push fires a ball across the box. The same holds
+  for grains (`blow(..., top)`).
+- **The black hole is a sensor.** `onCollision` skips sensor pairs and
+  `buildColliders` skips sensors, so grains fall *in* rather than resting on
+  it. Nothing that is being dragged is pulled or eaten.
+- **Effects are plain data on the `Scene`** (`effects`, aged by `Scene.time`,
+  capped at 64). A new flash is an `Effect` kind plus a case in `effectRings`.
+- **Tap to turn.** A press that stays within `TAP_SLOP` (5 css px) of where it
+  started is a tap, not a drag; on release a static toy with `turn` in its
+  metadata turns by that many radians. Dynamic bodies have no tap.
 - **Shared header UX.** Top bar in normal flow — home (`🏠`, `href="/"` → the
   `elnuevos.es` root) + `🧰` title on the left, controls and language on the
   right. Never absolutely positioned. Mirrors the sibling games.
@@ -239,7 +267,9 @@ Working: gravity, dragging/throwing with a soft constraint, spawning by click,
 delete tool and right-click delete, four balls, five blocks (including a static
 wedge ramp), breakable glass and brick, two conveyor belts, a ball spout, sand
 and water hoppers that pour into the box and are drawn by the same renderer,
-pitched note blocks (C major pentatonic, cycling), pause, mute, clear, EN/ES,
+pitched note blocks (C major pentatonic, cycling), the five gadgets (bomb with
+chain reactions, balloon, fan, trampoline, black hole - `PLAN.md §8`), tap to
+turn a fan or trampoline, pause, mute, clear, EN/ES,
 responsive palette, a live FPS/bodies readout, and the playfield size control.
 
 Performance is measured, not estimated: `PERFORMANCE.md` has the curves and
@@ -253,8 +283,8 @@ with sand sinking through it stays awake until it stops (`PLAN.md §10` has what
 shipped, what was tried and rejected, and what is still open).
 
 Ideas still open (see `PLAN.md §8`): saving a scene in `localStorage`, a
-"shake" button, funnels/dominoes as extra toy families, ropes and explosives on
-Matter constraints, a sound-block octave toggle, better mobile affordances
+"shake" button, funnels/dominoes as extra toy families, ropes on Matter
+constraints, a sound-block octave toggle, better mobile affordances
 (tap-to-place ghost), a worker to buy a frame of headroom (it must own both
 engines - see `PLAN.md §10`), and the dashboard
 card + `deploy.config.json` entry.

@@ -16,9 +16,61 @@ export type ToyId =
   | 'noteBlock'
   | 'ballSpawner'
   | 'sandSource'
-  | 'waterSource';
+  | 'waterSource'
+  | 'bomb'
+  | 'balloon'
+  | 'fan'
+  | 'trampoline'
+  | 'blackHole';
 
-export type ToyKind = 'ball' | 'block' | 'belt' | 'note' | 'spawner' | 'source';
+export type ToyKind =
+  | 'ball'
+  | 'block'
+  | 'belt'
+  | 'note'
+  | 'spawner'
+  | 'source'
+  | 'bomb'
+  | 'balloon'
+  | 'fan'
+  | 'trampoline'
+  | 'hole';
+
+/** A bomb's fuse, in simulated ms - so pausing the box pauses the countdown. */
+export interface FuseSpec {
+  left: number;
+  total: number;
+}
+
+/** A fan: wind along the body's "up" (its angle turns it). */
+export interface FanSpec {
+  /** 1 is a normal fan; scales both the push on bodies and on grains */
+  strength: number;
+  /** how far the wind carries, world px */
+  reach: number;
+}
+
+/** A trampoline: what it does to a body that lands on its top face. */
+export interface BounceSpec {
+  /** minimum speed it throws a body back out at, px/step */
+  launch: number;
+  /** the fastest it will ever throw anything, px/step */
+  max: number;
+}
+
+/** A black hole: pulls everything in range and swallows what reaches the core. */
+export interface HoleSpec {
+  /** world px */
+  reach: number;
+  /** change of speed per step near the middle, px/step² */
+  pull: number;
+  /** sideways part of the pull, as a fraction of it: makes things spiral */
+  swirl: number;
+  /** radius inside which things are gone, world px */
+  core: number;
+  /** what it has eaten so far (bodies and grains), for the readout */
+  ate: number;
+}
 
 /** A toy that releases balls on its own - the stress-test workhorse. */
 export interface SpawnerSpec {
@@ -80,6 +132,18 @@ export interface ToyMeta {
   shard?: boolean;
   /** performance.now() of the last strike, for the glow animation */
   hitAt?: number;
+  /** bomb: counts down every step, goes off at zero */
+  fuse?: FuseSpec;
+  /** balloon: upward push per step, as a multiple of gravity */
+  lift?: number;
+  /** balloon: impact speed (px/step) that pops it */
+  popsAt?: number;
+  fan?: FanSpec;
+  bounce?: BounceSpec;
+  hole?: HoleSpec;
+  /** a tap (press and release without dragging) turns a static toy by this
+   *  many radians - how a fan or a trampoline is aimed */
+  turn?: number;
 }
 
 /** Per-spawn context: the note block needs its place in the scale. */
